@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+
 def _normalize_email(email: Optional[str]) -> Optional[str]:
     """
     Валидируем e-mail по простой маске user@host.tld.
@@ -30,6 +31,7 @@ def _normalize_email(email: Optional[str]) -> Optional[str]:
         return None
     e = email.strip()
     return e if _EMAIL_RE.match(e) else None
+
 
 def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     """
@@ -44,6 +46,7 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     if len(digits) < 6:
         return None
     return f"{sign}{digits}"
+
 
 # -------------------------
 # Базовые вызовы
@@ -72,9 +75,8 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     def do() -> Dict[str, Any]:
         r = requests.post(url, json=params, timeout=REQUESTS_TIMEOUT)
         # Пытаемся всегда разобрать JSON — даже на 4xx, чтобы достать описание
-        data: Any
         try:
-            data = r.json()
+            data: Any = r.json()
         except ValueError:
             data = None
 
@@ -96,7 +98,6 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
         return data
 
-    # Повторы
     retries = int(REQUESTS_RETRIES or 0)
     backoff = float(REQUESTS_RETRY_BACKOFF or 1.0)
     last: Optional[Exception] = None
@@ -116,6 +117,7 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
     assert last is not None
     raise last
+
 
 # -------------------------
 # API-обёртки
@@ -154,24 +156,39 @@ def add_contact_quick(
 
 
 def find_contact_by_phone_or_email(phone: Optional[str], email: Optional[str]) -> Optional[int]:
-    # Используем нормализованные значения для поиска
-    n_phone = _normalize_phone(phone)
-    n_email = _normalize_email(email)
+    """
+    Ищем контакт по телефону/почте. Пробуем исходные значения (если переданы) и нормализованные.
+    Возвращаем ID первого найденного контакта, иначе None.
+    """
+    candidates: List[Dict[str, Dict[str, str]]] = []
 
-    filters: List[Dict[str, Dict[str, str]]] = []
-    if n_phone:
-        filters.append({"filter": {"PHONE": n_phone}})
-    if n_email:
-        filters.append({"filter": {"EMAIL": n_email}})
+    # телефон: сырой и нормализованный (если отличается)
+    if phone:
+        p_raw = phone.strip()
+        candidates.append({"filter": {"PHONE": p_raw}})
+        p_norm = _normalize_phone(phone)
+        if p_norm and p_norm != p_raw:
+            candidates.append({"filter": {"PHONE": p_norm}})
 
-    for f in filters:
+    # email: только валидный
+    if email:
+        e_raw = email.strip()
+        e_norm = _normalize_email(email)
+        if e_norm:
+            candidates.append({"filter": {"EMAIL": e_norm}})
+        else:
+            candidates.append({"filter": {"EMAIL": e_raw}})
+
+    for f in candidates:
         data = _call("crm.contact.list", {"filter": f["filter"], "select": ["ID"]})
         result = data.get("result")
         if isinstance(result, list) and result:
             first = result[0]
             if isinstance(first, dict) and "ID" in first:
                 try:
-                    return _to_int(first["ID"])
+                    cid = _to_int(first["ID"])
+                    log.debug("B24 CONTACT FOUND: filter=%s -> id=%s", f["filter"], cid)
+                    return cid
                 except Exception:
                     continue
     return None
@@ -185,7 +202,9 @@ def add_or_update_contact(
     email: Optional[str],
     comment: str,
 ) -> int:
-    # Сначала попытка найти (по нормализованным полям)
+    """
+    Ищем контакт по телефону/почте; если найден — обновляем, иначе создаём.
+    """
     contact_id = find_contact_by_phone_or_email(phone, email)
 
     n_phone = _normalize_phone(phone)
