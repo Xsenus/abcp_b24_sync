@@ -1,0 +1,99 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  APP_DIR: /opt/abcp_b24_sync
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Копируем код на сервер
+      - name: Upload files to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}          # задай в repo secrets (например, 22)
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          source: |
+            *.py
+            requirements.txt
+            .env.example
+            scripts/**
+          target: ${{ env.APP_DIR }}
+          overwrite: true
+          rm: true
+
+      # Настраиваем окружение и сервис только если его нет
+      - name: Configure & run systemd service on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${{ env.APP_DIR }}"
+            SERVICE_NAME="abcp-b24-sync"
+            SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+            # Каталоги
+            sudo mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
+            mkdir -p data logs scripts var
+
+            # venv + зависимости
+            if [ ! -x .venv/bin/python ]; then
+              python3 -m venv .venv
+            fi
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+            # Разрешения на сервисный скрипт
+            chmod +x scripts/run_service.sh
+
+            # Создаём systemd unit ТОЛЬКО если его ещё нет
+            if [ ! -f "$SERVICE_FILE" ]; then
+              echo "Creating systemd service $SERVICE_NAME..."
+              sudo tee "$SERVICE_FILE" >/dev/null <<'UNIT'
+            [Unit]
+            Description=ABCP -> Bitrix24 users sync service
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            WorkingDirectory=/opt/abcp_b24_sync
+            ExecStart=/bin/bash /opt/abcp_b24_sync/scripts/run_service.sh
+            Restart=always
+            RestartSec=10
+            Environment=PYTHONUNBUFFERED=1
+            # Если на сервере есть файл с переменными — он будет подхвачен (но мы его НЕ создаём)
+            EnvironmentFile=-/opt/abcp_b24_sync/.env
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+              sudo systemctl daemon-reload
+              sudo systemctl enable "$SERVICE_NAME"
+            else
+              echo "Service $SERVICE_NAME already exists — leaving unit file as-is."
+              sudo systemctl daemon-reload
+            fi
+
+            # Всегда перезапускаем, чтобы поднять свежий код
+            sudo systemctl restart "$SERVICE_NAME"
+            sudo systemctl --no-pager status "$SERVICE_NAME" || true

@@ -1,0 +1,69 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Виртуальные окружения
+.venv/
+.venv*/
+env/
+venv/
+
+# Конфиги окружения (храним только пример)
+.env
+.env.*
+!.env.example
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS мусор ---
+.DS_Store
+Thumbs.db
+
+# --- Сборка/дистрибуция ---
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# --- Тесты/покрытие/линтеры ---
+.pytest_cache/
+.coverage*
+htmlcov/
+.tox/
+.mypy_cache/
+.pytype/
+.pyright/
+.ruff_cache/
+
+# --- Логи ---
+logs/
+*.log
+# оставить каталог logs в репозитории при необходимости
+!logs/.gitkeep
+
+# --- Базы SQLite и локальные артефакты ---
+*.sqlite
+*.sqlite3
+*.db
+*.s3db
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+*-journal
+data/*.sqlite*
+data/*.db
+data/*.sqlite3
+# оставить каталог data в репозитории
+!data/.gitkeep
+
+# --- Временные/резервные файлы ---
+*.bak
+*.swp
+*.swo
+*.tmp
+~$*
