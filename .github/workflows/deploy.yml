@@ -29,7 +29,7 @@ jobs:
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: ./
+          source: ./              # копируем весь репозиторий
           target: ${{ env.APP_DIR }}
           overwrite: true
           rm: true
@@ -51,22 +51,38 @@ jobs:
             sudo chown -R "$USER":"$USER" "$APP_DIR"
             cd "$APP_DIR"
 
+            echo "[deps] Installing python/venv/pip if missing..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip
+            elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y python3 python3-pip
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y python3 python3-pip
+            elif command -v apk >/dev/null 2>&1; then
+              sudo apk add --no-cache python3 py3-pip
+            fi
+
             # каталоги
             mkdir -p data logs scripts var
 
-            # venv + зависимости
+            # venv + зависимости (с фолбэком на virtualenv)
             if [ ! -x .venv/bin/python ]; then
-              python3 -m venv .venv
+              if ! python3 -m venv .venv 2>/dev/null; then
+                python3 -m pip install --user virtualenv
+                python3 -m virtualenv .venv
+              fi
             fi
             . .venv/bin/activate
-            python -m pip install --upgrade pip
+            python -V
+            pip install --upgrade pip setuptools wheel
             pip install -r requirements.txt
 
             # убедимся, что сервисный скрипт исполняемый
             chmod +x scripts/run_service.sh
 
-            # systemd unit
-            sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<'UNIT'
+            # systemd unit (ВАЖНО: без кавычек у heredoc — подставит ${APP_DIR})
+            sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<UNIT
             [Unit]
             Description=ABCP -> Bitrix24 users sync service
             After=network-online.target
@@ -85,6 +101,6 @@ jobs:
             UNIT
 
             sudo systemctl daemon-reload
-            sudo systemctl enable abcp-b24-sync.service
+            sudo systemctl enable abcp-b24-sync.service || true
             sudo systemctl restart abcp-b24-sync.service
             sudo systemctl status --no-pager abcp-b24-sync.service || true
