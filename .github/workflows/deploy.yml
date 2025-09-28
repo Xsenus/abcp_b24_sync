@@ -90,14 +90,18 @@ jobs:
             Description=ABCP -> Bitrix24 users sync service
             After=network-online.target
             Wants=network-online.target
+            StartLimitIntervalSec=0
 
             [Service]
             Type=simple
-            WorkingDirectory=${APP_DIR}
-            ExecStart=/bin/bash ${APP_DIR}/scripts/run_service.sh
+            WorkingDirectory=/opt/abcp_b24_sync
+            ExecStart=/bin/bash /opt/abcp_b24_sync/scripts/run_service.sh
             Restart=always
             RestartSec=10
             Environment=PYTHONUNBUFFERED=1
+            # Environment=SYNC_INTERVAL_SECONDS=300
+            TimeoutStopSec=30s
+            KillSignal=SIGINT
 
             [Install]
             WantedBy=multi-user.target
