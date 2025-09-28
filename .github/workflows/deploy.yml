@@ -21,7 +21,7 @@ jobs:
           echo "-----"
           find . -maxdepth 2 -type f -print | sort
 
-      - name: Upload files to VPS
+      - name: Upload files to VPS (safe, keep .env)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -29,10 +29,15 @@ jobs:
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: ./              # копируем весь репозиторий
+          source: |
+            *.py
+            requirements.txt
+            README.md
+            .env.example
+            scripts/**
           target: ${{ env.APP_DIR }}
           overwrite: true
-          rm: true
+          rm: false
 
       - name: Configure & start systemd service on VPS
         uses: appleboy/ssh-action@v1.0.3
@@ -66,7 +71,7 @@ jobs:
             # каталоги
             mkdir -p data logs scripts var
 
-            # venv + зависимости (с фолбэком на virtualenv)
+            # venv + зависимости
             if [ ! -x .venv/bin/python ]; then
               if ! python3 -m venv .venv 2>/dev/null; then
                 python3 -m pip install --user virtualenv
@@ -81,7 +86,7 @@ jobs:
             # убедимся, что сервисный скрипт исполняемый
             chmod +x scripts/run_service.sh
 
-            # systemd unit (ВАЖНО: без кавычек у heredoc — подставит ${APP_DIR})
+            # systemd unit
             sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<UNIT
             [Unit]
             Description=ABCP -> Bitrix24 users sync service
