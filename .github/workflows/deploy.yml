@@ -21,7 +21,7 @@ jobs:
           echo "-----"
           find . -maxdepth 2 -type f -print | sort
 
-      - name: Upload files to VPS (safe, keep .env)
+      - name: Upload files to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -30,14 +30,16 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           source: |
-            *.py
+            **/*.py
             requirements.txt
             README.md
-            .env.example
+            LICENSE
+            .github/workflows/**
             scripts/**
           target: ${{ env.APP_DIR }}
           overwrite: true
           rm: false
+          debug: true
 
       - name: Configure & start systemd service on VPS
         uses: appleboy/ssh-action@v1.0.3
@@ -68,7 +70,6 @@ jobs:
               sudo apk add --no-cache python3 py3-pip
             fi
 
-            # каталоги
             mkdir -p data logs scripts var
 
             # venv + зависимости
@@ -83,7 +84,6 @@ jobs:
             pip install --upgrade pip setuptools wheel
             pip install -r requirements.txt
 
-            # убедимся, что сервисный скрипт исполняемый
             chmod +x scripts/run_service.sh
 
             # systemd unit
