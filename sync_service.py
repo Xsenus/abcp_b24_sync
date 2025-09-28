@@ -144,7 +144,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
 
     ДОПОЛНЕНО:
     - Ищем/обновляем контакт по телефону/email (без дублей) через add_or_update_contact;
-      фамилию/отчество не заполняем, в NAME пишем ровно то же, что в TITLE сделки.
+      фамилию/отчество не заполняем, в NAME пишем organizationName (если его нет — «Клиент №{userId}»).
     - TITLE сделки в формате: "Клиент №{userId}" (требование).
     - В сделку дополнительно пишем UF: Дата регистрации ABCP и Дата обновления ABCP.
     :param limit: ограничение количества записей за прогон (None — без лимита)
@@ -198,13 +198,13 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             reg_val      = _normalize_dt(reg_raw)
             upd_val      = _normalize_dt(upd_raw)
 
-            # Название сделки; оно же будет NAME контакта
-            # title = org_name or f"{B24_DEAL_TITLE_PREFIX} {abcp_user_id}"
+            # Название сделки; оно же НЕ используется для имени контакта
             title = f"Клиент №{abcp_user_id}"  # ← требование: записывать именно так
-            contact_name = title  # Критерий: имя контакта = название сделки
+            # ИМЯ контакта (NAME) — organizationName, если пусто — используем fallback = title
+            contact_name = org_name or title  # <<< ИЗМЕНЕНО по требованию
 
             logger.debug(
-                "Синхронизация: поля — abcp_user_id=%r, title/NAME=%r, has_phone=%s, has_email=%s, inn=%r, saldo_raw=%r, saldo_val=%r",
+                "Синхронизация: поля — abcp_user_id=%r, contact.NAME=%r, has_phone=%s, has_email=%s, inn=%r, saldo_raw=%r, saldo_val=%r",
                 abcp_user_id, contact_name, bool(phone), bool(email), inn, saldo_raw, saldo_val
             )
 
@@ -217,7 +217,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 # Комментарий с полезной информацией по источнику
                 comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
 
-                # НЕ пишем фамилию/отчество — только NAME = TITLE.
+                # НЕ пишем фамилию/отчество — только NAME = organizationName (или fallback).
                 # Ищем/обновляем по телефону/почте — не создаём дубликаты.
                 logger.debug(
                     "B24: add_or_update_contact → START; NAME=%r, has_phone=%s, has_email=%s",
@@ -248,7 +248,8 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 fields[UF_B24_DEAL_SALDO] = saldo_val
             elif saldo_raw:
                 fields[UF_B24_DEAL_SALDO] = saldo_raw
-                
+
+            # Доп. UF-поля дат из ABCP
             if reg_val:
                 fields[UF_B24_DEAL_REG_DATE] = reg_val
             if upd_val:
