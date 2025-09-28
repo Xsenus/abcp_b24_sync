@@ -21,7 +21,6 @@ log = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
 def _normalize_email(email: Optional[str]) -> Optional[str]:
     """
     Валидируем e-mail по простой маске user@host.tld.
@@ -31,7 +30,6 @@ def _normalize_email(email: Optional[str]) -> Optional[str]:
         return None
     e = email.strip()
     return e if _EMAIL_RE.match(e) else None
-
 
 def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     """
@@ -46,7 +44,6 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     if len(digits) < 6:
         return None
     return f"{sign}{digits}"
-
 
 # -------------------------
 # Базовые вызовы
@@ -98,6 +95,7 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
         return data
 
+    # Повторы
     retries = int(REQUESTS_RETRIES or 0)
     backoff = float(REQUESTS_RETRY_BACKOFF or 1.0)
     last: Optional[Exception] = None
@@ -117,7 +115,6 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
     assert last is not None
     raise last
-
 
 # -------------------------
 # API-обёртки
@@ -157,37 +154,27 @@ def add_contact_quick(
 
 def find_contact_by_phone_or_email(phone: Optional[str], email: Optional[str]) -> Optional[int]:
     """
-    Ищем контакт по телефону/почте. Пробуем исходные значения (если переданы) и нормализованные.
+    Ищем контакт по телефону/почте. Пробуем нормализованные значения.
     Возвращаем ID первого найденного контакта, иначе None.
     """
-    candidates: List[Dict[str, Dict[str, str]]] = []
+    queries: List[Dict[str, Any]] = []
+    n_phone = _normalize_phone(phone)
+    n_email = _normalize_email(email)
 
-    # телефон: сырой и нормализованный (если отличается)
-    if phone:
-        p_raw = phone.strip()
-        candidates.append({"filter": {"PHONE": p_raw}})
-        p_norm = _normalize_phone(phone)
-        if p_norm and p_norm != p_raw:
-            candidates.append({"filter": {"PHONE": p_norm}})
+    if n_phone:
+        queries.append({"filter": {"PHONE": n_phone}, "select": ["ID"]})
+    if n_email:
+        queries.append({"filter": {"EMAIL": n_email}, "select": ["ID"]})
 
-    # email: только валидный
-    if email:
-        e_raw = email.strip()
-        e_norm = _normalize_email(email)
-        if e_norm:
-            candidates.append({"filter": {"EMAIL": e_norm}})
-        else:
-            candidates.append({"filter": {"EMAIL": e_raw}})
-
-    for f in candidates:
-        data = _call("crm.contact.list", {"filter": f["filter"], "select": ["ID"]})
+    for q in queries:
+        data = _call("crm.contact.list", q)
         result = data.get("result")
         if isinstance(result, list) and result:
             first = result[0]
             if isinstance(first, dict) and "ID" in first:
                 try:
                     cid = _to_int(first["ID"])
-                    log.debug("B24 CONTACT FOUND: filter=%s -> id=%s", f["filter"], cid)
+                    log.debug("B24 CONTACT FOUND: %s -> id=%s", q["filter"], cid)
                     return cid
                 except Exception:
                     continue

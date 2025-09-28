@@ -43,6 +43,8 @@ B24_DEAL_STAGE_NEW_USERS   = os.getenv("B24_DEAL_STAGE_NEW_USERS", "").strip()  
 UF_B24_DEAL_ABCP_USER_ID = os.getenv("UF_B24_DEAL_ABCP_USER_ID", "UF_CRM_1738181468").strip()
 UF_B24_DEAL_INN          = os.getenv("UF_B24_DEAL_INN",          "UF_CRM_1713393074421").strip()
 UF_B24_DEAL_SALDO        = os.getenv("UF_B24_DEAL_SALDO",        "UF_CRM_1738182431").strip()
+UF_B24_DEAL_REG_DATE     = os.getenv("UF_B24_DEAL_REG_DATE",     "UF_CRM_1759089715").strip()
+UF_B24_DEAL_UPDATE_TIME  = os.getenv("UF_B24_DEAL_UPDATE_TIME",  "UF_CRM_1738256915999").strip()
 
 # ------------------------- Storage ----------------------
 
@@ -132,8 +134,9 @@ def log_config(level: int = logging.DEBUG) -> None:
     logger.log(level, "B24_DEAL_STAGE_NEW_USERS=%r", B24_DEAL_STAGE_NEW_USERS)
 
     # UF-поля
-    logger.log(level, "UF fields: ABCP_USER_ID=%s, INN=%s, SALDO=%s",
-               UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO)
+    logger.log(level, "UF fields: ABCP_USER_ID=%s, INN=%s, SALDO=%s, REG_DATE=%s, UPDATE_TIME=%s",
+               UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO,
+               UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME)
 
     # Storage / HTTP
     logger.log(level, "SQLITE_PATH=%s", SQLITE_PATH)

@@ -1,3 +1,5 @@
+# sync_service.py
+
 # Логирование шагов импорта/синхронизации
 import logging
 # Метки времени для полей синхронизации, и дата для инкрементального импорта
@@ -10,11 +12,12 @@ from sqlalchemy.orm import Session
 # Наши модули БД и клиентов
 from db import get_engine, init_db, User, upsert_user, set_meta
 from abcp_client import iter_all_users, iter_today_users
-from b24_client import add_contact_quick, add_deal_with_fields
+from b24_client import add_contact_quick, add_or_update_contact, add_deal_with_fields
 from config import (
     SQLITE_PATH, B24_DEAL_TITLE_PREFIX,             # путь к SQLite и дефолтный префикс для названия сделки
     B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS,  # настройки воронки «Пользователи»
     UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO,  # UF-поля сделки
+    UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME,
 )
 
 # Модульный логгер
@@ -117,11 +120,35 @@ def _parse_money_ru(s: Optional[str]) -> Optional[float]:
         return None
 
 
+def _normalize_dt(s: Optional[str]) -> Optional[str]:
+    """
+    Нормализует строку даты/времени к 'YYYY-MM-DD HH:MM:SS', если возможно.
+    Если не удалось — возвращает исходную строку/None.
+    """
+    if not s:
+        return None
+    raw = s.strip().replace("T", " ").replace("Z", "")
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return raw
+
+
 def sync_to_b24(limit: Optional[int] = None) -> int:
     """
-    Синхронизирует несинхронизированные записи в Bitrix24.
-    ВАЖНО: Контакт создаётся только с полем NAME, равным TITLE сделки.
-    LAST_NAME и SECOND_NAME не заполняются.
+    Синхронизирует несинхронизированные записи в Bitrix24:
+    - Быстро создаёт контакт (add_contact_quick), если его ещё нет в БД; иначе — переиспользует b24_contact_id.
+    - Создаёт сделку в воронке «Пользователи» (CATEGORY_ID/STAGE_ID) с заполнением UF-полей.
+    - Помечает запись как синхронизированную, фиксирует дату и ID сущностей B24.
+
+    ДОПОЛНЕНО:
+    - Ищем/обновляем контакт по телефону/email (без дублей) через add_or_update_contact;
+      фамилию/отчество не заполняем, в NAME пишем ровно то же, что в TITLE сделки.
+    - TITLE сделки в формате: "Клиент №{userId}" (требование).
+    - В сделку дополнительно пишем UF: Дата регистрации ABCP и Дата обновления ABCP.
+    :param limit: ограничение количества записей за прогон (None — без лимита)
+    :return: число успешно синхронизированных записей
     """
     # Идемпотентно гарантируем, что схема БД существует (устраняет 'no such table').
     init_db(SQLITE_PATH)
@@ -166,10 +193,14 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             inn          = (j.get("inn") or "").strip()
             saldo_raw    = (j.get("saldo") or "").strip()
             saldo_val    = _parse_money_ru(saldo_raw)
+            reg_raw      = (j.get("registrationDate") or u.registration_date or "").strip() or None
+            upd_raw      = (j.get("updateTime") or u.update_time or "").strip() or None
+            reg_val      = _normalize_dt(reg_raw)
+            upd_val      = _normalize_dt(upd_raw)
 
             # Название сделки; оно же будет NAME контакта
             # title = org_name or f"{B24_DEAL_TITLE_PREFIX} {abcp_user_id}"
-            title = f"Клиент №{abcp_user_id}"
+            title = f"Клиент №{abcp_user_id}"  # ← требование: записывать именно так
             contact_name = title  # Критерий: имя контакта = название сделки
 
             logger.debug(
@@ -186,14 +217,14 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 # Комментарий с полезной информацией по источнику
                 comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
 
+                # НЕ пишем фамилию/отчество — только NAME = TITLE.
+                # Ищем/обновляем по телефону/почте — не создаём дубликаты.
                 logger.debug(
-                    "B24: add_contact_quick → START; NAME=%r, has_phone=%s, has_email=%s",
+                    "B24: add_or_update_contact → START; NAME=%r, has_phone=%s, has_email=%s",
                     contact_name, bool(phone), bool(email)
                 )
-
-                # Создаём контакт (только NAME; фамилия/отчество — пусто)
-                contact_id = add_contact_quick(contact_name, "", "", phone, email, comment)
-                logger.info("B24: контакт создан быстро (NAME=%r), contact_id=%s", contact_name, contact_id)
+                contact_id = add_or_update_contact(contact_name, "", "", phone, email, comment)
+                logger.info("B24: контакт создан/обновлён (NAME=%r), contact_id=%s", contact_name, contact_id)
 
                 # Сохраняем contact_id сразу, чтобы не потерять при возможной ошибке сделки
                 u.b24_contact_id = str(contact_id)
@@ -217,6 +248,11 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 fields[UF_B24_DEAL_SALDO] = saldo_val
             elif saldo_raw:
                 fields[UF_B24_DEAL_SALDO] = saldo_raw
+                
+            if reg_val:
+                fields[UF_B24_DEAL_REG_DATE] = reg_val
+            if upd_val:
+                fields[UF_B24_DEAL_UPDATE_TIME] = upd_val
 
             logger.debug(
                 "B24: add_deal_with_fields → START; title=%r, CATEGORY_ID=%r, STAGE_ID=%r, CONTACT_ID=%r, UF_keys=%s",
