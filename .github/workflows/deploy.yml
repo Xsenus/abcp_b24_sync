@@ -10,7 +10,6 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,8 +21,20 @@ jobs:
           echo "-----"
           find . -maxdepth 2 -type f -print | sort
 
-      # Копируем только нужные файлы, НЕ трогаем .env / data / logs на сервере
-      - name: Upload files to VPS (scp)
+      # Собираем архив с нужными файлами (без .git и скрытых директорий)
+      - name: Make deploy bundle
+        run: |
+          set -euo pipefail
+          rm -f bundle.tgz
+          tar -czf bundle.tgz \
+            *.py \
+            requirements.txt \
+            README.md \
+            scripts
+          ls -lh bundle.tgz
+
+      # Передаём один архив на сервер (без очистки целевой папки!)
+      - name: Upload bundle to VPS (scp)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -31,16 +42,13 @@ jobs:
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: |
-            *.py
-            requirements.txt
-            README.md
-            scripts/**
-            .github/workflows/**
+          source: bundle.tgz
           target: ${{ env.APP_DIR }}
           overwrite: true
           rm: false
+          debug: true
 
+      # Разворачиваем бандл, ставим зависимости и (пере)запускаем сервис
       - name: Configure & start systemd service on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -58,6 +66,14 @@ jobs:
             sudo chown -R "$USER":"$USER" "$APP_DIR"
             cd "$APP_DIR"
 
+            # распаковываем новый бандл поверх существующих файлов (не трогаем .env/data/logs)
+            if [ -f bundle.tgz ]; then
+              tar -xzf bundle.tgz
+              rm -f bundle.tgz
+            else
+              echo "bundle.tgz not found in $APP_DIR"; exit 1
+            fi
+
             echo "[deps] Installing python/venv/pip if missing..."
             if command -v apt-get >/dev/null 2>&1; then
               sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
@@ -70,7 +86,6 @@ jobs:
               sudo apk add --no-cache python3 py3-pip
             fi
 
-            # каталоги и права
             mkdir -p data logs scripts var
             chmod +x scripts/run_service.sh
 
@@ -86,7 +101,7 @@ jobs:
             pip install --upgrade pip setuptools wheel
             pip install -r requirements.txt
 
-            # systemd unit (без кавычек у heredoc — подставит ${APP_DIR})
+            # systemd unit (подставит ${APP_DIR}); не трогаем .env/data/logs
             sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<UNIT
             [Unit]
             Description=ABCP -> Bitrix24 users sync service
