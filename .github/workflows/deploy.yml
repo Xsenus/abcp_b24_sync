@@ -21,6 +21,8 @@ jobs:
           echo "-----"
           find . -maxdepth 2 -type f -print | sort
 
+      # ВАЖНО: source — одна строка, паттерны через запятую.
+      # Копируем код/скрипты/конфиги репозитория; исключаем .env, .venv, __pycache__.
       - name: Upload files to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -29,13 +31,7 @@ jobs:
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: |
-            **/*.py
-            requirements.txt
-            README.md
-            LICENSE
-            .github/workflows/**
-            scripts/**
+          source: "**/*.py,*.py,requirements.txt,README.md,LICENSE,scripts/**,.github/workflows/**,!**/.env,!**/.venv/**,!**/__pycache__/**"
           target: ${{ env.APP_DIR }}
           overwrite: true
           rm: false
@@ -72,7 +68,6 @@ jobs:
 
             mkdir -p data logs scripts var
 
-            # venv + зависимости
             if [ ! -x .venv/bin/python ]; then
               if ! python3 -m venv .venv 2>/dev/null; then
                 python3 -m pip install --user virtualenv
@@ -82,11 +77,14 @@ jobs:
             . .venv/bin/activate
             python -V
             pip install --upgrade pip setuptools wheel
-            pip install -r requirements.txt
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
 
-            chmod +x scripts/run_service.sh
+            if [ -f scripts/run_service.sh ]; then
+              chmod +x scripts/run_service.sh
+            fi
 
-            # systemd unit
             sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<UNIT
             [Unit]
             Description=ABCP -> Bitrix24 users sync service
