@@ -104,18 +104,19 @@ jobs:
             # systemd unit (подставит ${APP_DIR}); не трогаем .env/data/logs
             sudo tee /etc/systemd/system/abcp-b24-sync.service >/dev/null <<UNIT
             [Unit]
-            Description=ABCP -> Bitrix24 users sync service
+            Description=ABCP -> Bitrix24 users sync daemon (Python)
             After=network-online.target
             Wants=network-online.target
 
             [Service]
             Type=simple
-            WorkingDirectory=${APP_DIR}
-            ExecStart=/bin/bash ${APP_DIR}/scripts/run_service.sh
+            WorkingDirectory=/opt/abcp_b24_sync
+            ExecStart=/opt/abcp_b24_sync/.venv/bin/python -m main
             Restart=always
-            RestartSec=10
+            RestartSec=5
             Environment=PYTHONUNBUFFERED=1
-            Environment=PATH=${APP_DIR}/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            Environment=SYNC_INTERVAL_SECONDS=1
+            Environment=PATH=/opt/abcp_b24_sync/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             StandardOutput=journal
             StandardError=journal
 
