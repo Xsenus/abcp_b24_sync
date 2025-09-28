@@ -168,7 +168,8 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             saldo_val    = _parse_money_ru(saldo_raw)
 
             # Название сделки; оно же будет NAME контакта
-            title = org_name or f"{B24_DEAL_TITLE_PREFIX} {abcp_user_id}"
+            # title = org_name or f"{B24_DEAL_TITLE_PREFIX} {abcp_user_id}"
+            title = f"Клиент №{abcp_user_id}"
             contact_name = title  # Критерий: имя контакта = название сделки
 
             logger.debug(
