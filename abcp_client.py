@@ -44,6 +44,9 @@ _LIMIT: int = int(ABCP_LIMIT or 500)
 # Максимум страниц — может быть None (тогда без лимита), иначе приводим к int
 _MAX_PAGES: Optional[int] = int(ABCP_MAX_PAGES) if ABCP_MAX_PAGES is not None else None
 
+# Защитный предел страниц при «сегодняшнем» обходе (чтобы не перебирать всё)
+_TODAY_MAX_PAGES: int = 5  # при необходимости вынесем в конфиг
+
 
 def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
     """
@@ -95,6 +98,35 @@ def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
     # Возвращаем тело ответа
     return data
 
+def _fetch_count() -> int:
+    """
+    Получает общее количество записей (count) одной лёгкой выборкой:
+    GET /cp/users?limit=0&skip=0&format=p&userlogin=...&userpsw=...
+    """
+    params: Dict[str, Any] = {
+        "userlogin": ABCP_USERLOGIN,
+        "userpsw": ABCP_USERPSW,
+        "limit": 0,
+        "skip": 0,
+        "format": "p",
+    }
+
+    log.debug("ABCP COUNT %s?limit=0&skip=0&format=p&userlogin=%s", ABCP_BASE_URL, ABCP_USERLOGIN)
+
+    def do() -> int:
+        r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict) or "count" not in data:
+            raise RuntimeError("ABCP count response has no 'count'")
+        try:
+            return int(str(data["count"]))
+        except Exception as e:
+            raise RuntimeError(f"ABCP count is not int-like: {data.get('count')!r}") from e
+
+    cnt = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
+    log.info("ABCP total count: %s", cnt)
+    return cnt
 
 def iter_all_users() -> Iterator[Dict[str, Any]]:
     """
@@ -154,6 +186,12 @@ def iter_all_users() -> Iterator[Dict[str, Any]]:
 def iter_today_users(today: Optional[date] = None) -> Iterator[Dict[str, Any]]:
     """
     Итерирует по пользователям, зарегистрированным «сегодня».
+
+    ВАЖНО: теперь НЕ вызываем iter_all_users (чтобы не обходить всё).
+    Идём постранично через _fetch_page и останавливаемся рано:
+    - как только встретим страницу, где все regDate < today (при сортировке по убыванию);
+    - или по достижении защитного лимита страниц.
+
     Клиентская фильтрация по полю 'registrationDate', начинающемуся с 'YYYY-MM-DD'.
     :param today: дата «сегодня» (для тестов можно подставить)
     :yield: словарь пользователя, отфильтрованный по текущей дате
@@ -166,19 +204,98 @@ def iter_today_users(today: Optional[date] = None) -> Iterator[Dict[str, Any]]:
     # Логируем старт инкрементальной выборки
     log.info("ABCP iterate today users: start for date=%s", today_str)
 
-    # Обходим всех пользователей и фильтруем по регистрации «сегодня»
-    for it in iter_all_users():
-        # Берём поле даты регистрации (может отсутствовать)
-        reg = (it.get("registrationDate") or "").strip()
-        # Идентификатор (для лога)
-        user_id = it.get("userId") or it.get("userID") or it.get("id")
-        # Логируем решение: совпало/не совпало
-        if reg.startswith(today_str):
-            log.debug("ABCP today match: userId=%r, registrationDate=%r", user_id, reg)
-            # Если дата начинается с сегодня — отдаём итератором
-            yield it
-        else:
-            log.debug("ABCP today skip:  userId=%r, registrationDate=%r", user_id, reg)
+    try:
+        total = _fetch_count()
+        if total <= 0:
+            log.info("ABCP today: total=0 — done.")
+            return
 
-    # Логируем окончание инкрементальной выборки
-    log.info("ABCP iterate today users: finished for date=%s", today_str)
+        limit = _LIMIT
+        last_skip = ((total - 1) // limit) * limit 
+        pages_checked = 0
+        seen_today = False
+
+        skip = last_skip
+        while skip >= 0:
+            if pages_checked >= _TODAY_MAX_PAGES:
+                log.warning("ABCP today(backward): reached safeguard pages limit=%s, stop early", _TODAY_MAX_PAGES)
+                break
+
+            payload = _fetch_page(skip=skip, limit=limit)
+            items = payload.get("items") or []
+            if not items:
+                log.info("ABCP today(backward): empty page at skip=%s — stop.", skip)
+                break
+
+            todays = []
+            for it in items:
+                reg = (it.get("registrationDate") or "").strip()
+                if reg.startswith(today_str):
+                    todays.append(it)
+
+            log.info("ABCP today(backward) skip=%s: todays=%s", skip, len(todays))
+
+            if todays:
+                seen_today = True
+                for it in todays:
+                    user_id = it.get("userId") or it.get("userID") or it.get("id")
+                    log.debug("ABCP today match: userId=%r, registrationDate=%r", user_id, it.get("registrationDate"))
+                    yield it
+            else:
+                if seen_today:
+                    log.info("ABCP today(backward): first non-today page after todays — stop early.")
+                    break
+
+            pages_checked += 1
+            skip -= limit
+
+        log.info("ABCP iterate today users: finished for date=%s (backward scan)", today_str)
+        return
+
+    except Exception as e:
+        log.warning("ABCP today(backward) failed (%s) — fallback to forward scan.", e)
+
+    skip = 0
+    page = 0
+    limit = _LIMIT
+    pages_yielded = 0
+
+    while True:
+        if page >= _TODAY_MAX_PAGES:
+            log.warning("ABCP today: reached safeguard pages limit=%s, stop early", _TODAY_MAX_PAGES)
+            break
+
+        payload = _fetch_page(skip=skip, limit=limit)
+        items = payload.get("items") or []
+        if not items:
+            log.info("ABCP today: no items on page=%s (skip=%s). Done.", page, skip)
+            break
+
+        todays = []
+        older_than_today = True 
+
+        for it in items:
+            reg = (it.get("registrationDate") or "").strip()
+            day = reg[:10] if len(reg) >= 10 else ""
+            if day >= today_str:
+                older_than_today = False
+            if day == today_str:
+                todays.append(it)
+
+        if todays:
+            for it in todays:
+                user_id = it.get("userId") or it.get("userID") or it.get("id")
+                log.debug("ABCP today match: userId=%r, registrationDate=%r", user_id, it.get("registrationDate"))
+                yield it
+            pages_yielded += 1
+        else:
+            log.debug("ABCP today: no matches on page=%s", page)
+
+        if older_than_today:
+            log.info("ABCP today: page=%s is older than %s — stop early", page, today_str)
+            break
+
+        skip += len(items)
+        page += 1
+
+    log.info("ABCP iterate today users: finished for date=%s (pages with matches=%s)", today_str, pages_yielded)
