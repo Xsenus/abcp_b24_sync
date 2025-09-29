@@ -19,17 +19,21 @@ log = logging.getLogger(__name__)
 # Утилиты нормализации
 # -------------------------
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 
 def _normalize_email(email: Optional[str]) -> Optional[str]:
     """
-    Валидируем e-mail по простой маске user@host.tld.
-    Возвращаем None, если некорректен/пустой.
+    Возвращает первый валидный email из строки (поддержка 'a@b,c@d' / 'a@b; c@d' / 'Имя <a@b>').
+    Если валидного нет — None (поле EMAIL в B24 не отправляем).
     """
     if not email:
         return None
-    e = email.strip()
-    return e if _EMAIL_RE.match(e) else None
+    
+    for token in re.split(r"[;,\s]+", email):
+        t = token.strip().strip("<>").strip('"').lower()
+        if _EMAIL_RE.match(t):
+            return t
+    return None
 
 def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     """

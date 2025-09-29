@@ -134,6 +134,25 @@ def _normalize_dt(s: Optional[str]) -> Optional[str]:
     except Exception:
         return raw
 
+def _safe_add_or_update_contact(name: str,
+                                phone: Optional[str],
+                                email: Optional[str],
+                                comment: str) -> Optional[int]:
+    """
+    Сначала пробуем создать/обновить контакт с email.
+    Если Bitrix24 вернул ошибку (например, из-за кривого email) — повторяем без EMAIL.
+    Если снова ошибка — возвращаем None (запись будет пропущена).
+    """
+    try:
+        return add_or_update_contact(name, "", "", phone, email, comment)
+    except Exception as e1:
+        logger.warning("Контакт: ошибка при add_or_update (с email): %s — пробую без EMAIL", e1)
+        try:
+            return add_or_update_contact(name, "", "", phone, None, comment)
+        except Exception as e2:
+            logger.error("Контакт: не удалось даже без EMAIL: %s — пропускаю запись", e2)
+            return None
+
 
 def sync_to_b24(limit: Optional[int] = None) -> int:
     """
@@ -223,7 +242,13 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                     "B24: add_or_update_contact → START; NAME=%r, has_phone=%s, has_email=%s",
                     contact_name, bool(phone), bool(email)
                 )
-                contact_id = add_or_update_contact(contact_name, "", "", phone, email, comment)
+                
+                contact_id = _safe_add_or_update_contact(contact_name, phone, email, comment)
+                if not contact_id:
+                    session.rollback()
+                    logger.warning("Синхронизация: #%d пропущена (контакт не создан) — abcp_user_id=%s", idx, abcp_user_id)
+                    continue
+
                 logger.info("B24: контакт создан/обновлён (NAME=%r), contact_id=%s", contact_name, contact_id)
 
                 # Сохраняем contact_id сразу, чтобы не потерять при возможной ошибке сделки
