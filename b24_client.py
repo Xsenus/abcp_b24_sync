@@ -128,10 +128,45 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_bad_email_error(e: Exception) -> bool:
     msg = str(e).lower()
-    return ("email" in msg or "e-mail" in msg or "e-mail" in msg) and ("некоррект" in msg or "invalid" in msg)
+    return ("email" in msg or "e-mail" in msg) and ("некоррект" in msg or "invalid" in msg)
 
 # -------------------------
-# API-обёртки
+# Общий билдер полей контакта
+# -------------------------
+
+def _build_contact_fields(
+    name: Optional[str],
+    phone: Optional[str],
+    email: Optional[str],
+    comment: str,
+    *,
+    last_name: str = "",
+    second_name: str = "",
+) -> Dict[str, Any]:
+    """
+    Строит словарь полей для crm.contact.add/update:
+    - NAME — как передано (или пустая строка)
+    - LAST_NAME/SECOND_NAME — по умолчанию принудительно пустые строки
+    - EMAIL/PHONE — нормализуются; при отсутствии не включаются
+    """
+    n_phone = _normalize_phone(phone)
+    n_email = _normalize_email(email)
+
+    fields: Dict[str, Any] = {
+        "NAME": name or "",
+        "LAST_NAME": last_name,
+        "SECOND_NAME": second_name,
+        "OPENED": "Y",
+        "COMMENTS": comment or "",
+    }
+    if n_phone:
+        fields["PHONE"] = [{"VALUE": n_phone, "VALUE_TYPE": "WORK"}]
+    if n_email:
+        fields["EMAIL"] = [{"VALUE": n_email, "VALUE_TYPE": "WORK"}]
+    return fields
+
+# -------------------------
+# API-обёртки (общие)
 # -------------------------
 
 def add_contact_quick(
@@ -142,27 +177,24 @@ def add_contact_quick(
     email: Optional[str],
     comment: str,
 ) -> int:
-    # Нормализуем поля контакта
-    n_phone = _normalize_phone(phone)
-    n_email = _normalize_email(email)
-
-    fields: Dict[str, Any] = {
-        "NAME": name or "",
-        "LAST_NAME": last_name or "",
-        "SECOND_NAME": second_name or "",
-        "OPENED": "Y",
-        "COMMENTS": comment or "",
-    }
-    if n_phone:
-        fields["PHONE"] = [{"VALUE": n_phone, "VALUE_TYPE": "WORK"}]
-    if n_email:
-        fields["EMAIL"] = [{"VALUE": n_email, "VALUE_TYPE": "WORK"}]
+    """
+    БАЗОВЫЙ вариант (совместимость): использует переданные ФИО как есть.
+    Для ABCP используйте add_contact_quick_abcp().
+    """
+    fields = _build_contact_fields(
+        name=name,
+        phone=phone,
+        email=email,
+        comment=comment,
+        last_name=last_name or "",
+        second_name=second_name or "",
+    )
 
     log.info(
         "B24 CONTACT ADD (quick): name=%r, last=%r, has_phone=%s, has_email=%s",
-        fields.get("NAME"), fields.get("LAST_NAME"), bool(n_phone), bool(n_email),
+        fields.get("NAME"), fields.get("LAST_NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
     )
-    # --- FIX: мягкая обработка «битого» e-mail ---
+    # --- Мягкая обработка «битого» e-mail ---
     try:
         data = _call("crm.contact.add", {"fields": fields})
         return _to_int(data.get("result"))
@@ -214,26 +246,20 @@ def add_or_update_contact(
     comment: str,
 ) -> int:
     """
-    Ищем контакт по телефону/почте; если найден — обновляем, иначе создаём.
+    БАЗОВЫЙ вариант (совместимость): ищем по телефону/почте; если найден — обновляем, иначе создаём.
+    Для ABCP используйте add_or_update_contact_abcp().
     """
     contact_id = find_contact_by_phone_or_email(phone, email)
+    fields = _build_contact_fields(
+        name=name,
+        phone=phone,
+        email=email,
+        comment=comment,
+        last_name=last_name or "",
+        second_name=second_name or "",
+    )
 
-    n_phone = _normalize_phone(phone)
-    n_email = _normalize_email(email)
-
-    fields: Dict[str, Any] = {
-        "NAME": name or "",
-        "LAST_NAME": last_name or "",
-        "SECOND_NAME": second_name or "",
-        "OPENED": "Y",
-        "COMMENTS": comment or "",
-    }
-    if n_phone:
-        fields["PHONE"] = [{"VALUE": n_phone, "VALUE_TYPE": "WORK"}]
-    if n_email:
-        fields["EMAIL"] = [{"VALUE": n_email, "VALUE_TYPE": "WORK"}]
-
-    # Вспомогательные замыкания
+    # Вспомогательные функции
     def _create(f: Dict[str, Any]) -> int:
         data = _call("crm.contact.add", {"fields": f})
         return _to_int(data.get("result"))
@@ -249,11 +275,11 @@ def add_or_update_contact(
         else:
             log.info(
                 "B24 CONTACT ADD: name=%r, last=%r, has_phone=%s, has_email=%s",
-                fields.get("NAME"), fields.get("LAST_NAME"), bool(n_phone), bool(n_email),
+                fields.get("NAME"), fields.get("LAST_NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
             )
             return _create(fields)
     except Exception as e:
-        # --- FIX: мягкая обработка «битого» e-mail для add/update ---
+        # --- Мягкая обработка «битого» e-mail для add/update ---
         if _is_bad_email_error(e) and "EMAIL" in fields:
             log.warning("B24 CONTACT add/update: bad email, retry without EMAIL; err=%s", e)
             fields_wo_email = dict(fields)
@@ -265,6 +291,97 @@ def add_or_update_contact(
                 return _create(fields_wo_email)
         raise
 
+# -------------------------
+# ABCP-специфичные обёртки
+# -------------------------
+
+def add_contact_quick_abcp(
+    organization_name: Optional[str],
+    phone: Optional[str],
+    email: Optional[str],
+    comment: str,
+) -> int:
+    """
+    ABCP: NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
+    """
+    fields = _build_contact_fields(
+        name=organization_name or "",
+        phone=phone,
+        email=email,
+        comment=comment,
+        last_name="",
+        second_name="",
+    )
+
+    log.info(
+        "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s",
+        fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+    )
+    try:
+        data = _call("crm.contact.add", {"fields": fields})
+        return _to_int(data.get("result"))
+    except Exception as e:
+        if _is_bad_email_error(e) and "EMAIL" in fields:
+            log.warning("B24 CONTACT ADD (ABCP): bad email, retry without EMAIL; err=%s", e)
+            fields_wo_email = dict(fields)
+            fields_wo_email.pop("EMAIL", None)
+            data = _call("crm.contact.add", {"fields": fields_wo_email})
+            return _to_int(data.get("result"))
+        raise
+
+
+def add_or_update_contact_abcp(
+    organization_name: Optional[str],
+    phone: Optional[str],
+    email: Optional[str],
+    comment: str,
+) -> int:
+    """
+    ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
+    """
+    contact_id = find_contact_by_phone_or_email(phone, email)
+    fields = _build_contact_fields(
+        name=organization_name or "",
+        phone=phone,
+        email=email,
+        comment=comment,
+        last_name="",
+        second_name="",
+    )
+
+    def _create(f: Dict[str, Any]) -> int:
+        data = _call("crm.contact.add", {"fields": f})
+        return _to_int(data.get("result"))
+
+    def _update(cid: int, f: Dict[str, Any]) -> None:
+        _call("crm.contact.update", {"id": cid, "fields": f})
+
+    try:
+        if contact_id is not None:
+            log.info("B24 CONTACT UPDATE (ABCP): id=%s", contact_id)
+            _update(contact_id, fields)
+            return contact_id
+        else:
+            log.info(
+                "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s",
+                fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+            )
+            return _create(fields)
+    except Exception as e:
+        if _is_bad_email_error(e) and "EMAIL" in fields:
+            log.warning("B24 CONTACT add/update (ABCP): bad email, retry without EMAIL; err=%s", e)
+            fields_wo_email = dict(fields)
+            fields_wo_email.pop("EMAIL", None)
+            if contact_id is not None:
+                _update(contact_id, fields_wo_email)
+                return contact_id
+            else:
+                return _create(fields_wo_email)
+        raise
+
+# -------------------------
+# Сделки
+# -------------------------
 
 def add_deal_with_fields(fields: Dict[str, Any]) -> int:
     log.info(

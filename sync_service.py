@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Наши модули БД и клиентов
 from db import get_engine, init_db, User, upsert_user, set_meta
 from abcp_client import iter_all_users, iter_today_users
-from b24_client import add_contact_quick, add_or_update_contact, add_deal_with_fields
+from b24_client import add_or_update_contact_abcp, add_deal_with_fields
 from config import (
     SQLITE_PATH, B24_DEAL_TITLE_PREFIX,             # путь к SQLite и дефолтный префикс для названия сделки
     B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS,  # настройки воронки «Пользователи»
@@ -244,16 +244,19 @@ def _safe_add_or_update_contact(name: str,
                                 email: Optional[str],
                                 comment: str) -> Optional[int]:
     """
+    ABCP-логика контакта:
+      - NAME ← organizationName (или fallback)
+      - LAST_NAME/SECOND_NAME всегда пустые (делает b24_client.add_or_update_contact_abcp)
     Сначала пробуем создать/обновить контакт с email.
-    Если Bitrix24 вернул ошибку (например, из-за кривого email) — повторяем без EMAIL.
+    Если Bitrix24 вернул ошибку — повторяем без EMAIL.
     Если снова ошибка — возвращаем None (запись будет пропущена).
     """
     try:
-        return add_or_update_contact(name, "", "", phone, email, comment)
+        return add_or_update_contact_abcp(name, phone, email, comment)
     except Exception as e1:
         logger.warning("Контакт: ошибка при add_or_update (с email): %s — пробую без EMAIL", e1)
         try:
-            return add_or_update_contact(name, "", "", phone, None, comment)
+            return add_or_update_contact_abcp(name, phone, None, comment)
         except Exception as e2:
             logger.error("Контакт: не удалось даже без EMAIL: %s — пропускаю запись", e2)
             return None
@@ -262,15 +265,13 @@ def _safe_add_or_update_contact(name: str,
 def sync_to_b24(limit: Optional[int] = None) -> int:
     """
     Синхронизирует несинхронизированные записи в Bitrix24:
-    - Быстро создаёт контакт (add_contact_quick), если его ещё нет в БД; иначе — переиспользует b24_contact_id.
-    - Создаёт сделку в воронке «Пользователи» (CATEGORY_ID/STAGE_ID) с заполнением UF-полей.
-    - Помечает запись как синхронизированную, фиксирует дату и ID сущностей B24.
-
-    ДОПОЛНЕНО:
-    - Ищем/обновляем контакт по телефону/email (без дублей) через add_or_update_contact;
+    - Ищем/обновляем контакт по телефону/email (без дублей) через add_or_update_contact_abcp;
       фамилию/отчество не заполняем, в NAME пишем organizationName (если его нет — «Клиент №{userId}»).
-    - TITLE сделки в формате: "Клиент №{userId}" (требование).
-    - В сделку дополнительно пишем UF: Дата регистрации ABCP и Дата обновления ABCP.
+    - Создаём сделку в воронке «Пользователи» (CATEGORY_ID/STAGE_ID) с заполнением UF-полей.
+    - Помечаем запись как синхронизированную, фиксируем дату и ID сущностей B24.
+
+    TITLE сделки в формате: "Клиент №{userId}".
+    Дополнительно пишем UF: дата регистрации ABCP и дата обновления ABCP (в ISO-8601 с tz B24_OUT_TZ_ISO).
     :param limit: ограничение количества записей за прогон (None — без лимита)
     :return: число успешно синхронизированных записей
     """
@@ -322,32 +323,28 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             reg_val      = _normalize_dt(reg_raw)
             upd_val      = _normalize_dt(upd_raw)
 
-            # Название сделки; оно же НЕ используется для имени контакта
-            title = f"Клиент №{abcp_user_id}"  # ← требование: записывать именно так
-            # ИМЯ контакта (NAME) — organizationName, если пусто — используем fallback = title
-            contact_name = org_name or title  # <<< ИЗМЕНЕНО по требованию
+            # Название сделки
+            title = f"Клиент №{abcp_user_id}"
+            # Имя контакта — строго organizationName; если пусто — fallback на title
+            contact_name = org_name or title
 
             logger.debug(
                 "Синхронизация: поля — abcp_user_id=%r, contact.NAME=%r, has_phone=%s, has_email=%s, inn=%r, saldo_raw=%r, saldo_val=%r",
                 abcp_user_id, contact_name, bool(phone), bool(email), inn, saldo_raw, saldo_val
             )
 
-            # Контакт: быстрый сценарий — создаём только если ещё нет ID в БД
+            # Контакт: создаём/обновляем, если нет привязки
             if u.b24_contact_id:
-                # Если уже есть ID контакта — переиспользуем
                 contact_id = int(u.b24_contact_id)
                 logger.debug("B24: reuse contact_id=%s из БД", contact_id)
             else:
-                # Комментарий с полезной информацией по источнику
                 comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
 
-                # НЕ пишем фамилию/отчество — только NAME = organizationName (или fallback).
-                # Ищем/обновляем по телефону/почте — не создаём дубликаты.
                 logger.debug(
-                    "B24: add_or_update_contact → START; NAME=%r, has_phone=%s, has_email=%s",
+                    "B24: add_or_update_contact_abcp → START; NAME=%r, has_phone=%s, has_email=%s",
                     contact_name, bool(phone), bool(email)
                 )
-                
+
                 contact_id = _safe_add_or_update_contact(contact_name, phone, email, comment)
                 if not contact_id:
                     session.rollback()
@@ -356,7 +353,6 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
 
                 logger.info("B24: контакт создан/обновлён (NAME=%r), contact_id=%s", contact_name, contact_id)
 
-                # Сохраняем contact_id сразу, чтобы не потерять при возможной ошибке сделки
                 u.b24_contact_id = str(contact_id)
                 session.commit()
                 logger.debug("B24: contact_id=%s сохранён в БД", contact_id)
@@ -367,19 +363,18 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 "CATEGORY_ID": B24_DEAL_CATEGORY_ID_USERS,  # Категория (воронка «Пользователи»)
                 "STAGE_ID": B24_DEAL_STAGE_NEW_USERS,       # Стартовая стадия
                 "CONTACT_ID": contact_id,                   # Привязка к контакту
-                # UF-поля (соответствие из вашего ТЗ)
-                UF_B24_DEAL_ABCP_USER_ID: abcp_user_id,     # ID клиента ABCP
-                UF_B24_DEAL_INN: inn,                       # ИНН
+                # UF-поля
+                UF_B24_DEAL_ABCP_USER_ID: abcp_user_id,
+                UF_B24_DEAL_INN: inn,
             }
 
-            # Баланс: если удалось распарсить — отправляем числом,
-            # иначе — исходной строкой (на случай если UF-поле строкового типа)
+            # Баланс
             if saldo_val is not None:
                 fields[UF_B24_DEAL_SALDO] = saldo_val
             elif saldo_raw:
                 fields[UF_B24_DEAL_SALDO] = saldo_raw
 
-            # Доп. UF-поля дат из ABCP (ISO-8601 с tz из B24_OUT_TZ_ISO)
+            # Даты ABCP (ISO-8601 с tz)
             if reg_val:
                 fields[UF_B24_DEAL_REG_DATE] = reg_val
             if upd_val:
@@ -392,11 +387,9 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             )
 
             try:
-                # Создаём сделку одной командой (быстро)
                 deal_id = add_deal_with_fields(fields)
                 logger.info("B24: сделка создана (воронка «Пользователи», TITLE=%r), deal_id=%s", title, deal_id)
 
-                # Отмечаем запись как синхронизированную
                 u.b24_deal_id = str(deal_id)
                 u.synced = True
                 u.synced_at = datetime.utcnow()
@@ -407,13 +400,11 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                     idx, contact_id, deal_id
                 )
             except Exception as e:
-                # Ошибка на уровне сделки — откатываем и продолжаем со следующей записью
                 logger.error(
                     "Синхронизация: #%d ошибка создания сделки для abcp_user_id=%s: %s",
                     idx, abcp_user_id, e
                 )
                 session.rollback()
 
-    # Итоговый лог по количеству успехов
     logger.info("Синхронизация завершена: успешно %d из %d", synced, len(batch))
     return synced
