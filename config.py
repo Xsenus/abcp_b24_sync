@@ -62,6 +62,13 @@ UF_B24_DEAL_SALDO        = os.getenv("UF_B24_DEAL_SALDO",        "UF_CRM_1738182
 UF_B24_DEAL_REG_DATE     = os.getenv("UF_B24_DEAL_REG_DATE",     "UF_CRM_1759089715").strip()
 UF_B24_DEAL_UPDATE_TIME  = os.getenv("UF_B24_DEAL_UPDATE_TIME",  "UF_CRM_1738256915999").strip()
 
+# ------------------------- Timezones --------------------
+
+# Часовой пояс входящих дат из ABCP (по умолчанию Europe/Moscow)
+ABCP_TIMEZONE = os.getenv("ABCP_TIMEZONE", "Europe/Moscow").strip()
+# Часовой пояс, в котором отдаём даты в Bitrix24 (оставляем Москву, чтобы Б24 уже сам конвертировал при показе)
+B24_OUT_TZ_ISO = os.getenv("B24_OUT_TZ_ISO", "Europe/Moscow").strip()
+
 # ------------------------- Storage ----------------------
 
 # Путь к локальной SQLite-БД (по умолчанию data/abcp_b24.sqlite3)
@@ -156,6 +163,9 @@ def log_config(level: int = logging.DEBUG) -> None:
     logger.log(level, "UF fields: ABCP_USER_ID=%s, INN=%s, SALDO=%s, REG_DATE=%s, UPDATE_TIME=%s",
                UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO,
                UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME)
+
+    # Timezones
+    logger.log(level, "Timezones: ABCP_TIMEZONE=%r, B24_OUT_TZ_ISO=%r", ABCP_TIMEZONE, B24_OUT_TZ_ISO)
 
     # Storage / HTTP
     logger.log(level, "SQLITE_PATH=%s", SQLITE_PATH)

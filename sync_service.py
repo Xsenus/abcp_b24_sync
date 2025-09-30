@@ -2,12 +2,15 @@
 
 # Логирование шагов импорта/синхронизации
 import logging
+import re  # для разбора офсета в TZ
 # Метки времени для полей синхронизации, и дата для инкрементального импорта
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 # Аннотации типов
 from typing import Iterable, Optional, Dict, Any
 # Сессии ORM
 from sqlalchemy.orm import Session
+# Часовые пояса
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Наши модули БД и клиентов
 from db import get_engine, init_db, User, upsert_user, set_meta
@@ -18,6 +21,7 @@ from config import (
     B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS,  # настройки воронки «Пользователи»
     UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO,  # UF-поля сделки
     UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME,
+    ABCP_TIMEZONE, B24_OUT_TZ_ISO
 )
 
 # Модульный логгер
@@ -120,19 +124,120 @@ def _parse_money_ru(s: Optional[str]) -> Optional[float]:
         return None
 
 
+# ===== TZ helpers =====
+
+_TZ_OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
+
+def _tz_from_str(s: str):
+    """
+    Поддерживает:
+      - офсет: '+03:00', '-01:00'
+      - IANA: 'Europe/Moscow', 'UTC', ...
+    Если база таймзон недоступна (Windows без tzdata), делаем безопасный fallback:
+      - 'UTC' -> timezone.utc
+      - 'Europe/Moscow' -> UTC+03:00 (в РФ нет DST)
+      - иначе -> timezone.utc
+    """
+    s = (s or "").strip()
+
+    # 1) Явный офсет ±HH:MM
+    m = _TZ_OFFSET_RE.match(s)
+    if m:
+        sign, hh, mm = m.groups()
+        minutes = int(hh) * 60 + int(mm)
+        if sign == '-':
+            minutes = -minutes
+        return timezone(timedelta(minutes=minutes))
+
+    # 2) Попытка IANA через ZoneInfo
+    try:
+        return ZoneInfo(s or "UTC")
+    except ZoneInfoNotFoundError as e:
+        logging.getLogger(__name__).warning("ZoneInfo not found for %r (%s); using fallback.", s or "UTC", e)
+        key = (s or "UTC").strip().lower()
+        if key in ("utc", "etc/utc", "z"):
+            return timezone.utc
+        if key == "europe/moscow":
+            # В РФ нет перехода на летнее время — +03:00 стабильно
+            return timezone(timedelta(hours=3))
+        # общий fallback
+        return timezone.utc
+
 def _normalize_dt(s: Optional[str]) -> Optional[str]:
     """
-    Нормализует строку даты/времени к 'YYYY-MM-DD HH:MM:SS', если возможно.
-    Если не удалось — возвращает исходную строку/None.
+    Нормализует дату/время от ABCP:
+      1) аккуратно парсит разные форматы ('YYYY-MM-DD HH:MM[:SS][.mmm]', 'DD.MM.YYYY HH:MM[:SS]', ISO с tz, и т.д.)
+      2) трактует как ABCP_TIMEZONE (если на входе нет tz),
+      3) конвертирует в B24_OUT_TZ_ISO (IANA или офсет ±HH:MM),
+      4) возвращает ISO-8601 с tz: 'YYYY-MM-DDTHH:MM:SS±HH:MM'.
     """
     if not s:
         return None
-    raw = s.strip().replace("T", " ").replace("Z", "")
+
+    # ——— ШАГ 0. Санитайзинг — убираем NBSP/узкие пробелы, приводим T->' ' и отрезаем Z ———
+    raw = (
+        s.replace("\u00A0", " ")  # NBSP
+         .replace("\u2007", " ")  # Figure space
+         .replace("\u202F", " ")  # Narrow NBSP
+         .strip()
+         .replace("T", " ")
+         .replace("Z", "")        # ISO 'Z' (UTC)
+    )
+
+    # ——— ШАГ 1. Быстрая попытка через fromisoformat ———
+    dt: Optional[datetime]
     try:
         dt = datetime.fromisoformat(raw)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
+        dt = None
+
+    # ——— ШАГ 2. Попробуем через набор strptime-шаблонов ———
+    if dt is None:
+        from datetime import datetime as _DT
+
+        tmp = raw
+        # уберём миллисекунды, если есть (наши паттерны без дробной части)
+        if "." in tmp:
+            left, right = tmp.split(".", 1)
+            if right and right[0].isdigit():
+                tmp = left
+
+        # Игнорируем возможный встроенный офсет, парсить будем без него
+        m = re.search(r'([+-]\d{2}:\d{2})$', tmp)
+        if m:
+            tmp = tmp[: -len(m.group(1))].strip()
+
+        patterns = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d.%m.%Y %H:%M:%S",
+            "%d.%m.%Y %H:%M",
+            "%d.%m.%Y",
+        ]
+
+        for p in patterns:
+            try:
+                dt = _DT.strptime(tmp, p)
+                break
+            except Exception:
+                continue
+
+    # ——— ШАГ 3. Если так и не распарсили — вернём исходное, чтобы запись не упала ———
+    if dt is None:
         return raw
+
+    # ——— ШАГ 4. Навешиваем исходный TZ и конвертируем в целевой ———
+    src_tz = _tz_from_str(ABCP_TIMEZONE or "Europe/Moscow")
+    out_tz = _tz_from_str(B24_OUT_TZ_ISO or "Europe/Moscow")
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=src_tz)
+    else:
+        dt = dt.astimezone(src_tz)
+
+    return dt.astimezone(out_tz).isoformat(timespec="seconds")
+
 
 def _safe_add_or_update_contact(name: str,
                                 phone: Optional[str],
@@ -274,7 +379,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             elif saldo_raw:
                 fields[UF_B24_DEAL_SALDO] = saldo_raw
 
-            # Доп. UF-поля дат из ABCP
+            # Доп. UF-поля дат из ABCP (ISO-8601 с tz из B24_OUT_TZ_ISO)
             if reg_val:
                 fields[UF_B24_DEAL_REG_DATE] = reg_val
             if upd_val:
