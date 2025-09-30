@@ -153,14 +153,14 @@ def _build_contact_fields(
     email: Optional[str],
     comment: str,
     *,
-    last_name: str = "",
-    second_name: str = "",
+    last_name: Optional[str] = None,
+    second_name: Optional[str] = None,
     inn: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Строит словарь полей для crm.contact.add/update:
     - NAME — как передано (или пустая строка)
-    - LAST_NAME/SECOND_NAME — по умолчанию принудительно пустые строки
+    - LAST_NAME/SECOND_NAME — отправляем ТОЛЬКО если непустые (Bitrix не будет затирать существующие значения)
     - EMAIL/PHONE — нормализуются; при отсутствии не включаются
     - UF_CRM_1759218031 — ИНН (если валиден: 10 или 12 цифр)
     """
@@ -170,8 +170,6 @@ def _build_contact_fields(
 
     fields: Dict[str, Any] = {
         "NAME": name or "",
-        "LAST_NAME": last_name,
-        "SECOND_NAME": second_name,
         "OPENED": "Y",
         "COMMENTS": comment or "",
     }
@@ -181,6 +179,10 @@ def _build_contact_fields(
         fields["EMAIL"] = [{"VALUE": n_email, "VALUE_TYPE": "WORK"}]
     if n_inn:
         fields["UF_CRM_1759218031"] = n_inn
+    if last_name:
+        fields["LAST_NAME"] = last_name
+    if second_name:
+        fields["SECOND_NAME"] = second_name
 
     return fields
 
@@ -199,7 +201,7 @@ def add_contact_quick(
     inn: Optional[str] = None,
 ) -> int:
     """
-    БАЗОВЫЙ вариант (совместимость): использует переданные ФИО как есть.
+    БАЗОВЫЙ вариант (совместимость): использует переданные ФИО как есть (если они непустые).
     Для ABCP используйте add_contact_quick_abcp().
     """
     fields = _build_contact_fields(
@@ -207,8 +209,8 @@ def add_contact_quick(
         phone=phone,
         email=email,
         comment=comment,
-        last_name=last_name or "",
-        second_name=second_name or "",
+        last_name=last_name or None,
+        second_name=second_name or None,
         inn=inn,
     )
 
@@ -280,8 +282,8 @@ def add_or_update_contact(
         phone=phone,
         email=email,
         comment=comment,
-        last_name=last_name or "",
-        second_name=second_name or "",
+        last_name=last_name or None,
+        second_name=second_name or None,
         inn=inn,
     )
 
@@ -331,15 +333,13 @@ def add_contact_quick_abcp(
     inn: Optional[str] = None,
 ) -> int:
     """
-    ABCP: NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
+    ABCP: NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе.
     """
     fields = _build_contact_fields(
         name=organization_name or "",
         phone=phone,
         email=email,
         comment=comment,
-        last_name="",
-        second_name="",
         inn=inn,
     )
 
@@ -370,7 +370,7 @@ def add_or_update_contact_abcp(
     inn: Optional[str] = None,
 ) -> int:
     """
-    ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
+    ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе.
     """
     contact_id = find_contact_by_phone_or_email(phone, email)
     fields = _build_contact_fields(
@@ -378,8 +378,6 @@ def add_or_update_contact_abcp(
         phone=phone,
         email=email,
         comment=comment,
-        last_name="",
-        second_name="",
         inn=inn,
     )
 
@@ -416,6 +414,24 @@ def add_or_update_contact_abcp(
             else:
                 return _create(fields_wo_email)
         raise
+
+# -------------------------
+# Сервисные методы
+# -------------------------
+
+def wipe_contact_fio(contact_id: int) -> None:
+    """
+    Явно «обнуляет» ФИО у контакта: LAST_NAME="", SECOND_NAME="".
+    Полезно для одноразовой очистки исторически заполненных полей.
+    """
+    try:
+        _call("crm.contact.update", {
+            "id": contact_id,
+            "fields": {"LAST_NAME": "", "SECOND_NAME": ""}
+        })
+        log.debug("B24: FIO wiped (LAST_NAME/SECOND_NAME cleared) for contact_id=%s", contact_id)
+    except Exception as e:
+        log.warning("B24: FIO wipe failed for contact_id=%s: %s", contact_id, e)
 
 # -------------------------
 # Сделки

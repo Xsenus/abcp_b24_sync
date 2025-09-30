@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Наши модули БД и клиентов
 from db import get_engine, init_db, User, upsert_user, set_meta
 from abcp_client import iter_all_users, iter_today_users
-from b24_client import add_or_update_contact_abcp, add_deal_with_fields
+from b24_client import add_or_update_contact_abcp, add_deal_with_fields, wipe_contact_fio  # + очистка ФИО
 from config import (
     SQLITE_PATH, B24_DEAL_TITLE_PREFIX,             # путь к SQLite и дефолтный префикс для названия сделки
     B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS,  # настройки воронки «Пользователи»
@@ -212,7 +212,7 @@ def _normalize_dt(s: Optional[str]) -> Optional[str]:
             "%Y-%m-%d %H:%M",
             "%Y-%m-%d",
             "%d.%m.%Y %H:%M:%S",
-            "%d.%m.%Y %H:%M",
+            "%d.%m.%Y %H:%М",
             "%d.%m.%Y",
         ]
 
@@ -359,6 +359,10 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 u.b24_contact_id = str(contact_id)
                 session.commit()
                 logger.debug("B24: contact_id=%s сохранён в БД", contact_id)
+
+            # Явно очищаем LAST_NAME/SECOND_NAME у контакта (идемпотентно; если уже пусто — ничего не делает)
+            # Важно: это не затирает NAME (organizationName), затрагиваются только фамилия/отчество.
+            wipe_contact_fio(int(contact_id))
 
             # Готовим поля сделки (воронка «Пользователи»)
             fields: Dict[str, Any] = {
