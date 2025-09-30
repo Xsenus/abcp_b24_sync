@@ -242,7 +242,9 @@ def _normalize_dt(s: Optional[str]) -> Optional[str]:
 def _safe_add_or_update_contact(name: str,
                                 phone: Optional[str],
                                 email: Optional[str],
-                                comment: str) -> Optional[int]:
+                                comment: str,
+                                *,
+                                inn: Optional[str] = None) -> Optional[int]:
     """
     ABCP-логика контакта:
       - NAME ← organizationName (или fallback)
@@ -252,11 +254,11 @@ def _safe_add_or_update_contact(name: str,
     Если снова ошибка — возвращаем None (запись будет пропущена).
     """
     try:
-        return add_or_update_contact_abcp(name, phone, email, comment)
+        return add_or_update_contact_abcp(name, phone, email, comment, inn=inn)
     except Exception as e1:
         logger.warning("Контакт: ошибка при add_or_update (с email): %s — пробую без EMAIL", e1)
         try:
-            return add_or_update_contact_abcp(name, phone, None, comment)
+            return add_or_update_contact_abcp(name, phone, None, comment, inn=inn)
         except Exception as e2:
             logger.error("Контакт: не удалось даже без EMAIL: %s — пропускаю запись", e2)
             return None
@@ -268,7 +270,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
     - Ищем/обновляем контакт по телефону/email (без дублей) через add_or_update_contact_abcp;
       фамилию/отчество не заполняем, в NAME пишем organizationName (если его нет — «Клиент №{userId}»).
     - Создаём сделку в воронке «Пользователи» (CATEGORY_ID/STAGE_ID) с заполнением UF-полей.
-    - Помечаем запись как синхронизированную, фиксируем дату и ID сущностей B24.
+    - Помечаем запись как синхронизированную, фиксируем дату и ID сущностей Б24.
 
     TITLE сделки в формате: "Клиент №{userId}".
     Дополнительно пишем UF: дата регистрации ABCP и дата обновления ABCP (в ISO-8601 с tz B24_OUT_TZ_ISO).
@@ -345,13 +347,14 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                     contact_name, bool(phone), bool(email)
                 )
 
-                contact_id = _safe_add_or_update_contact(contact_name, phone, email, comment)
+                contact_id = _safe_add_or_update_contact(contact_name, phone, email, comment, inn=inn)
                 if not contact_id:
                     session.rollback()
                     logger.warning("Синхронизация: #%d пропущена (контакт не создан) — abcp_user_id=%s", idx, abcp_user_id)
                     continue
 
                 logger.info("B24: контакт создан/обновлён (NAME=%r), contact_id=%s", contact_name, contact_id)
+                logger.debug("B24: контакт %s обновлён/создан; ИНН=%r отправлен в UF_CRM_1759218031", contact_id, inn or None)
 
                 u.b24_contact_id = str(contact_id)
                 session.commit()

@@ -51,6 +51,19 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
         return None
     return f"{sign}{digits}"
 
+# Нормализация ИНН
+def _normalize_inn(inn: Optional[str]) -> Optional[str]:
+    """
+    Оставляет только цифры. Валидны длины 10 (юрлица) или 12 (физлица/ИП).
+    Если невалидно — вернём None (поле UF_CRM_1759218031 не отправляем).
+    """
+    if not inn:
+        return None
+    digits = re.sub(r"\D", "", str(inn))
+    if len(digits) in (10, 12):
+        return digits
+    return None
+
 # -------------------------
 # Базовые вызовы
 # -------------------------
@@ -142,15 +155,18 @@ def _build_contact_fields(
     *,
     last_name: str = "",
     second_name: str = "",
+    inn: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Строит словарь полей для crm.contact.add/update:
     - NAME — как передано (или пустая строка)
     - LAST_NAME/SECOND_NAME — по умолчанию принудительно пустые строки
     - EMAIL/PHONE — нормализуются; при отсутствии не включаются
+    - UF_CRM_1759218031 — ИНН (если валиден: 10 или 12 цифр)
     """
     n_phone = _normalize_phone(phone)
     n_email = _normalize_email(email)
+    n_inn = _normalize_inn(inn)
 
     fields: Dict[str, Any] = {
         "NAME": name or "",
@@ -163,6 +179,9 @@ def _build_contact_fields(
         fields["PHONE"] = [{"VALUE": n_phone, "VALUE_TYPE": "WORK"}]
     if n_email:
         fields["EMAIL"] = [{"VALUE": n_email, "VALUE_TYPE": "WORK"}]
+    if n_inn:
+        fields["UF_CRM_1759218031"] = n_inn
+
     return fields
 
 # -------------------------
@@ -176,6 +195,8 @@ def add_contact_quick(
     phone: Optional[str],
     email: Optional[str],
     comment: str,
+    *,
+    inn: Optional[str] = None,
 ) -> int:
     """
     БАЗОВЫЙ вариант (совместимость): использует переданные ФИО как есть.
@@ -188,11 +209,13 @@ def add_contact_quick(
         comment=comment,
         last_name=last_name or "",
         second_name=second_name or "",
+        inn=inn,
     )
 
     log.info(
-        "B24 CONTACT ADD (quick): name=%r, last=%r, has_phone=%s, has_email=%s",
-        fields.get("NAME"), fields.get("LAST_NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+        "B24 CONTACT ADD (quick): name=%r, last=%r, has_phone=%s, has_email=%s, has_inn=%s",
+        fields.get("NAME"), fields.get("LAST_NAME"),
+        bool(fields.get("PHONE")), bool(fields.get("EMAIL")), bool(fields.get("UF_CRM_1759218031")),
     )
     # --- Мягкая обработка «битого» e-mail ---
     try:
@@ -244,6 +267,8 @@ def add_or_update_contact(
     phone: Optional[str],
     email: Optional[str],
     comment: str,
+    *,
+    inn: Optional[str] = None,
 ) -> int:
     """
     БАЗОВЫЙ вариант (совместимость): ищем по телефону/почте; если найден — обновляем, иначе создаём.
@@ -257,6 +282,7 @@ def add_or_update_contact(
         comment=comment,
         last_name=last_name or "",
         second_name=second_name or "",
+        inn=inn,
     )
 
     # Вспомогательные функции
@@ -269,13 +295,14 @@ def add_or_update_contact(
 
     try:
         if contact_id is not None:
-            log.info("B24 CONTACT UPDATE: id=%s", contact_id)
+            log.info("B24 CONTACT UPDATE: id=%s, has_inn=%s", contact_id, bool(fields.get("UF_CRM_1759218031")))
             _update(contact_id, fields)
             return contact_id
         else:
             log.info(
-                "B24 CONTACT ADD: name=%r, last=%r, has_phone=%s, has_email=%s",
-                fields.get("NAME"), fields.get("LAST_NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+                "B24 CONTACT ADD: name=%r, has_phone=%s, has_email=%s, has_inn=%s",
+                fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+                bool(fields.get("UF_CRM_1759218031")),
             )
             return _create(fields)
     except Exception as e:
@@ -300,6 +327,8 @@ def add_contact_quick_abcp(
     phone: Optional[str],
     email: Optional[str],
     comment: str,
+    *,
+    inn: Optional[str] = None,
 ) -> int:
     """
     ABCP: NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
@@ -311,11 +340,13 @@ def add_contact_quick_abcp(
         comment=comment,
         last_name="",
         second_name="",
+        inn=inn,
     )
 
     log.info(
-        "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s",
+        "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s, has_inn=%s",
         fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+        bool(fields.get("UF_CRM_1759218031")),
     )
     try:
         data = _call("crm.contact.add", {"fields": fields})
@@ -335,6 +366,8 @@ def add_or_update_contact_abcp(
     phone: Optional[str],
     email: Optional[str],
     comment: str,
+    *,
+    inn: Optional[str] = None,
 ) -> int:
     """
     ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME="", SECOND_NAME="" всегда.
@@ -347,6 +380,7 @@ def add_or_update_contact_abcp(
         comment=comment,
         last_name="",
         second_name="",
+        inn=inn,
     )
 
     def _create(f: Dict[str, Any]) -> int:
@@ -358,13 +392,17 @@ def add_or_update_contact_abcp(
 
     try:
         if contact_id is not None:
-            log.info("B24 CONTACT UPDATE (ABCP): id=%s", contact_id)
+            log.info(
+                "B24 CONTACT UPDATE (ABCP): id=%s, has_inn=%s",
+                contact_id, bool(fields.get("UF_CRM_1759218031")),
+            )
             _update(contact_id, fields)
             return contact_id
         else:
             log.info(
-                "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s",
+                "B24 CONTACT ADD (ABCP): name=%r, has_phone=%s, has_email=%s, has_inn=%s",
                 fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
+                bool(fields.get("UF_CRM_1759218031")),
             )
             return _create(fields)
     except Exception as e:
