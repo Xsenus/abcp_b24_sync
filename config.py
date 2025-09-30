@@ -1,7 +1,7 @@
 # config.py
 
 # Подгрузка переменных окружения из файла .env (если есть)
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 # Доступ к системным переменным окружения
 import os
 # Хелперы приведения типов с дефолтами (из нашего utils.py)
@@ -10,9 +10,25 @@ from utils import getenv_int, getenv_float
 import logging
 # Разбор URL, чтобы безопасно логировать домен вебхука Bitrix24
 from urllib.parse import urlparse
+from pathlib import Path
 
 # 1) Загружаем .env в процесс (os.environ пополняется значениями из файла)
-load_dotenv()
+#    ВАЖНО: Явно находим .env, чтобы не зависеть от текущей рабочей директории/IDE.
+#    .env.example НЕ грузим. Для отладки можно выставить DOTENV_OVERRIDE=1.
+_DOTENV_OVERRIDE = os.getenv("DOTENV_OVERRIDE", "").strip().lower() in ("1", "true", "yes")
+_env_path = os.getenv("DOTENV_PATH", "").strip()
+if _env_path:
+    _env_path = Path(_env_path).expanduser().resolve()
+else:
+    # сначала пробуем найти от CWD, затем — рядом с этим файлом
+    _auto = find_dotenv(filename=".env", usecwd=True)
+    _env_path = Path(_auto).resolve() if _auto else (Path(__file__).resolve().parent / ".env")
+
+if isinstance(_env_path, (str, Path)) and Path(_env_path).exists():
+    load_dotenv(dotenv_path=_env_path, override=_DOTENV_OVERRIDE)
+    logging.getLogger(__name__).info("dotenv loaded: %s (override=%s)", _env_path, _DOTENV_OVERRIDE)
+else:
+    logging.getLogger(__name__).warning("dotenv NOT loaded: .env not found (cwd=%s)", Path.cwd())
 
 # ------------------------- ABCP -------------------------
 
@@ -121,6 +137,9 @@ def log_config(level: int = logging.DEBUG) -> None:
     - с ключевыми параметрами и их наличием.
     """
     logger = logging.getLogger(__name__)
+    # .env — откуда загрузили (для диагностики)
+    logger.log(level, "ENV loaded from: %s", str(_env_path) if _env_path else "(not found)")
+
     # ABCP
     logger.log(level, "ABCP_BASE_URL=%s", ABCP_BASE_URL or "(empty)")
     logger.log(level, "ABCP_USERLOGIN=%s", ABCP_USERLOGIN or "(empty)")

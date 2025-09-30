@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+# .env лежит в корне проекта рядом с main.py
+os.environ.setdefault("DOTENV_PATH", str(BASE_DIR / ".env"))
+# На время локальной отладки можно перебить переменные среды значениями из .env:
+os.environ.setdefault("DOTENV_OVERRIDE", "1")
+# Зафиксируем рабочую директорию на корень проекта (пути к БД/логам будут предсказуемы)
+os.chdir(BASE_DIR)
+
 import sys
 import time
 import signal
@@ -8,7 +19,7 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, date
 from typing import Optional
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv
 
 from config import assert_config, SQLITE_PATH
 from db import init_db, get_engine, get_meta, set_meta
@@ -76,8 +87,13 @@ def _mark_full_import(session: Session) -> None:
 
 
 def run_daemon() -> None:
-    load_dotenv()  # на случай локального запуска с .env
     _setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+
+    # Диагностика: покажем, какой .env определён и где нас запустили
+    logging.info("CWD=%s", os.getcwd())
+    logging.info("ENV file=%s (found=%s)",
+                 os.environ.get("DOTENV_PATH"),
+                 bool(find_dotenv(filename=".env", usecwd=True)))
 
     logging.info("Service start. DB=%s", SQLITE_PATH)
 
@@ -86,8 +102,11 @@ def run_daemon() -> None:
     init_db(SQLITE_PATH)
 
     # Сигналы для graceful shutdown
-    signal.signal(signal.SIGINT, _handle_sig)   # Ctrl+C / systemd stop
-    signal.signal(signal.SIGTERM, _handle_sig)  # systemd stop
+    signal.signal(signal.SIGINT, _handle_sig)
+    try:
+        signal.signal(signal.SIGTERM, _handle_sig) 
+    except Exception:
+        pass
 
     # Один раз — полный импорт, если ещё не делали
     with Session(get_engine(SQLITE_PATH)) as session:
