@@ -38,7 +38,8 @@ _RETRIES: int = int(REQUESTS_RETRIES or 3)
 # Базовая задержка между повторами как float
 _BACKOFF: float = float(REQUESTS_RETRY_BACKOFF or 1.5)
 # Пауза между удачными запросами (rate-limit) как float
-_SLEEP: float = float(RATE_LIMIT_SLEEP or 0.0)
+# Минимальный интервал между запросами в секундах (ABCP требует ≥3 сек)
+_RATE_LIMIT_INTERVAL: float = max(float(RATE_LIMIT_SLEEP or 0.0), 3.0)
 # Лимит записей на страницу как целое число
 _LIMIT: int = int(ABCP_LIMIT or 500)
 # Максимум страниц — может быть None (тогда без лимита), иначе приводим к int
@@ -46,6 +47,35 @@ _MAX_PAGES: Optional[int] = int(ABCP_MAX_PAGES) if ABCP_MAX_PAGES is not None el
 
 # Защитный предел страниц при «сегодняшнем» обходе (чтобы не перебирать всё)
 _TODAY_MAX_PAGES: int = 5  # при необходимости вынесем в конфиг
+
+
+_last_request_ts: Optional[float] = None
+
+
+def _wait_rate_limit() -> None:
+    """Блокирует выполнение, чтобы обеспечить минимум 3 сек между запросами."""
+    if _RATE_LIMIT_INTERVAL <= 0:
+        return
+
+    global _last_request_ts
+    if _last_request_ts is None:
+        return
+
+    now = time.monotonic()
+    wait_until = _last_request_ts + _RATE_LIMIT_INTERVAL
+    if wait_until > now:
+        delay = wait_until - now
+        log.debug("Rate-limit wait before request: %.3fs", delay)
+        time.sleep(delay)
+
+
+def _mark_request_complete() -> None:
+    """Фиксирует время завершения запроса для следующей паузы."""
+    if _RATE_LIMIT_INTERVAL <= 0:
+        return
+
+    global _last_request_ts
+    _last_request_ts = time.monotonic()
 
 
 def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
@@ -70,17 +100,21 @@ def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
 
     # Внутренняя функция, непосредственно выполняющая HTTP-вызов
     def do() -> Dict[str, Any]:
-        # Выполняем GET на ABCP_BASE_URL с параметрами и таймаутом
-        r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
-        # Бросаем исключение при HTTP-ошибке (4xx/5xx)
-        r.raise_for_status()
-        # Пытаемся распарсить JSON
-        data = r.json()
-        # Проверяем тип, ожидаем словарь (dict)
-        if not isinstance(data, dict):
-            raise RuntimeError(f"Unexpected ABCP response type: {type(data)}")
-        # Возвращаем распарсенный JSON
-        return data
+        _wait_rate_limit()
+        try:
+            # Выполняем GET на ABCP_BASE_URL с параметрами и таймаутом
+            r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
+            # Бросаем исключение при HTTP-ошибке (4xx/5xx)
+            r.raise_for_status()
+            # Пытаемся распарсить JSON
+            data = r.json()
+            # Проверяем тип, ожидаем словарь (dict)
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected ABCP response type: {type(data)}")
+            # Возвращаем распарсенный JSON
+            return data
+        finally:
+            _mark_request_complete()
 
     # Вызываем do() с повторами при ошибках (retries/backoff настроены в константах выше)
     data = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
@@ -89,11 +123,6 @@ def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
     items = data.get("items")
     log.debug("ABCP page fetched: skip=%s, limit=%s, items_count=%s",
               skip, limit, (len(items) if isinstance(items, list) else "n/a"))
-
-    # Делаем небольшую паузу для соблюдения rate-limit (если задана)
-    if _SLEEP > 0:
-        log.debug("Rate-limit sleep: %s sec", _SLEEP)
-        time.sleep(_SLEEP)
 
     # Возвращаем тело ответа
     return data
@@ -114,15 +143,19 @@ def _fetch_count() -> int:
     log.debug("ABCP COUNT %s?limit=0&skip=0&format=p&userlogin=%s", ABCP_BASE_URL, ABCP_USERLOGIN)
 
     def do() -> int:
-        r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, dict) or "count" not in data:
-            raise RuntimeError("ABCP count response has no 'count'")
+        _wait_rate_limit()
         try:
-            return int(str(data["count"]))
-        except Exception as e:
-            raise RuntimeError(f"ABCP count is not int-like: {data.get('count')!r}") from e
+            r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict) or "count" not in data:
+                raise RuntimeError("ABCP count response has no 'count'")
+            try:
+                return int(str(data["count"]))
+            except Exception as e:
+                raise RuntimeError(f"ABCP count is not int-like: {data.get('count')!r}") from e
+        finally:
+            _mark_request_complete()
 
     cnt = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
     log.info("ABCP total count: %s", cnt)

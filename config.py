@@ -83,7 +83,8 @@ REQUESTS_RETRIES       = getenv_int("REQUESTS_RETRIES", 3)
 # Базовая задержка между повторами (сек)
 REQUESTS_RETRY_BACKOFF = getenv_float("REQUESTS_RETRY_BACKOFF", 1.5)
 # Пауза между успешными вызовами (сек) — бережём rate-limits
-RATE_LIMIT_SLEEP       = getenv_float("RATE_LIMIT_SLEEP", 0.2)
+# По требованию ABCP выдерживаем минимум 3 секунды между вызовами.
+RATE_LIMIT_SLEEP       = getenv_float("RATE_LIMIT_SLEEP", 3.0)
 
 # ---------------------- Проверка конфигурации ----------------------
 
