@@ -156,11 +156,13 @@ def _build_contact_fields(
     last_name: Optional[str] = None,
     second_name: Optional[str] = None,
     inn: Optional[str] = None,
+    force_blank_fio: bool = False,
 ) -> Dict[str, Any]:
     """
     Строит словарь полей для crm.contact.add/update:
     - NAME — как передано (или пустая строка)
     - LAST_NAME/SECOND_NAME — отправляем ТОЛЬКО если непустые (Bitrix не будет затирать существующие значения)
+      или если явно запрошено force_blank_fio (чтобы сбросить автозаполнение B24)
     - EMAIL/PHONE — нормализуются; при отсутствии не включаются
     - UF_CRM_1759218031 — ИНН (если валиден: 10 или 12 цифр)
     """
@@ -181,8 +183,13 @@ def _build_contact_fields(
         fields["UF_CRM_1759218031"] = n_inn
     if last_name:
         fields["LAST_NAME"] = last_name
+    elif force_blank_fio:
+        fields["LAST_NAME"] = ""
+
     if second_name:
         fields["SECOND_NAME"] = second_name
+    elif force_blank_fio:
+        fields["SECOND_NAME"] = ""
 
     return fields
 
@@ -333,7 +340,7 @@ def add_contact_quick_abcp(
     inn: Optional[str] = None,
 ) -> int:
     """
-    ABCP: NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе.
+    ABCP: NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе (принудительно очищаем).
     """
     fields = _build_contact_fields(
         name=organization_name or "",
@@ -341,6 +348,7 @@ def add_contact_quick_abcp(
         email=email,
         comment=comment,
         inn=inn,
+        force_blank_fio=True,
     )
 
     log.info(
@@ -370,7 +378,8 @@ def add_or_update_contact_abcp(
     inn: Optional[str] = None,
 ) -> int:
     """
-    ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе.
+    ABCP: ищем по телефону/почте; NAME ← organizationName; LAST_NAME/SECOND_NAME не отправляем вовсе
+    (принудительно очищаем).
     """
     contact_id = find_contact_by_phone_or_email(phone, email)
     fields = _build_contact_fields(
@@ -379,6 +388,7 @@ def add_or_update_contact_abcp(
         email=email,
         comment=comment,
         inn=inn,
+        force_blank_fio=True,
     )
 
     def _create(f: Dict[str, Any]) -> int:
