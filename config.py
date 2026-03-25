@@ -1,7 +1,7 @@
 # config.py
 
 # Подгрузка переменных окружения из файла .env (если есть)
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv, find_dotenv, dotenv_values
 # Доступ к системным переменным окружения
 import os
 # Хелперы приведения типов с дефолтами (из нашего utils.py)
@@ -25,8 +25,8 @@ else:
     _env_path = Path(_auto).resolve() if _auto else (Path(__file__).resolve().parent / ".env")
 
 if isinstance(_env_path, (str, Path)) and Path(_env_path).exists():
-    load_dotenv(dotenv_path=_env_path, override=_DOTENV_OVERRIDE)
-    logging.getLogger(__name__).info("dotenv loaded: %s (override=%s)", _env_path, _DOTENV_OVERRIDE)
+    _loaded = load_dotenv(dotenv_path=_env_path, override=_DOTENV_OVERRIDE, encoding="utf-8-sig")
+    logging.getLogger(__name__).info("dotenv loaded: %s (override=%s, loaded=%s)", _env_path, _DOTENV_OVERRIDE, _loaded)
 else:
     logging.getLogger(__name__).warning("dotenv NOT loaded: .env not found (cwd=%s)", Path.cwd())
 
@@ -97,6 +97,21 @@ def assert_config() -> None:
     """
     logger = logging.getLogger(__name__)
     logger.debug("Проверка обязательных переменных окружения...")
+
+    if _env_path and Path(_env_path).exists() and not ABCP_BASE_URL:
+        try:
+            parsed = dotenv_values(_env_path, encoding="utf-8-sig")
+        except Exception as exc:
+            logger.warning("Не удалось повторно разобрать .env (%s): %s", _env_path, exc)
+        else:
+            key_names = list(parsed.keys())
+            logger.error(
+                "ABCP_BASE_URL пуст после загрузки .env=%s. parsed_keys=%s",
+                _env_path,
+                key_names[:10],
+            )
+            if "\ufeffABCP_BASE_URL" in parsed:
+                logger.error("Найден ключ с BOM-префиксом: '\\ufeffABCP_BASE_URL'. Пересохраните .env в UTF-8 без BOM.")
 
     # Требуемые параметры для ABCP
     assert ABCP_BASE_URL,  "ABCP_BASE_URL required"
