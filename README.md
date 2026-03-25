@@ -1,289 +1,264 @@
-# ABCP → Bitrix24 Users Sync (Python, SQLite)
+# ABCP -> Bitrix24 Sync
 
-Надёжный офлайн-скрипт для импорта пользователей из **ABCP** в локальную БД (SQLite) и их синхронизации с **Bitrix24**:
+Сервис синхронизирует пользователей из ABCP в локальную SQLite и затем выгружает их в Bitrix24:
 
-- создаётся/обновляется **Контакт** (быстрый путь);
-- создаётся **Сделка** в воронке «Пользователи» с заполнением UF-полей.
+- создаёт или обновляет контакт;
+- создаёт или обновляет сделку в воронке "Пользователи";
+- хранит локальные связи `b24_contact_id` и `b24_deal_id`, чтобы не дублировать сущности.
 
----
+## Как это работает сейчас
 
-## Возможности
+Текущая рабочая схема после live-проверки:
 
-- **Полная первичная загрузка** всех пользователей ABCP (постранично).
-- **Инкрементальная загрузка** «зарегистрированы сегодня» (клиентская фильтрация по `registrationDate`).
-- Локальная БД **SQLite** с флагами синхронизации и датами (`synced`, `synced_at`, `b24_contact_id`, `b24_deal_id`).
-- **Быстрая синхронизация в Bitrix24**: контакт создаётся без поиска (`add_contact_quick`) и затем создаётся сделка в воронке «Пользователи».
-- **Повторы/таймауты и жёсткий rate-limit**: между любыми запросами к ABCP выдерживается минимум 3 секунды.
-- **CLI-команды**: `init-db`, `import-all`, `import-today`, `sync-b24`, `run`.
-- **Автолог**: по умолчанию логи пишутся в файл за текущую дату `logs/sync_YYYY-MM-DD.log` + в консоль.
-- **Идемпотентная инициализация БД**: схема автоматически создаётся перед операциями.
+1. Один раз выполняется полный импорт всех пользователей ABCP.
+2. Дальше сервис работает инкрементально по `updateTime`.
+3. На каждом тике берётся окно изменений с overlap, чтобы не потерять записи на границе запусков.
+4. В Bitrix24 синхронизируются только записи, у которых реально изменился исходный JSON.
 
----
+Важно:
 
-## Требования
+- По live-проверке от **25 марта 2026** параметры `dateRegisteredStart/dateRegisteredEnd` на вашем ABCP endpoint фактически не фильтровали выборку и возвращали почти весь массив пользователей.
+- Поэтому регулярный инкремент в проекте переведён на `dateUpdatedStart/dateUpdatedEnd`.
+- Для новых регистраций этого достаточно, потому что у новых пользователей `updateTime` совпадает с `registrationDate`.
 
-- Python 3.10+
-- Зависимости (см. `requirements.txt`):
+## Основные команды
 
-```text
-python-dotenv==1.0.1
-requests==2.32.3
-SQLAlchemy==2.0.35
-```
-
----
-
-## Быстрый старт
-
-1. Скопируйте `/.env.example` → `/.env` и заполните переменные (особенно воронку и UF-поля).
-
-2. Установите зависимости и активируйте окружение.
-
-   **Linux/macOS:**
-
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-   **Windows PowerShell:**
-
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
-   ```
-
-3. Инициализация БД:
-
-   ```bash
-   python cli.py init-db
-   ```
-
-4. Полный импорт и синхронизация:
-
-   ```bash
-   python cli.py run
-   # или отдельно
-   python cli.py import-all
-   python cli.py sync-b24
-   ```
-
-5. Ежедневный инкремент:
-
-   ```bash
-   python cli.py import-today
-   python cli.py sync-b24
-   ```
-
-> По умолчанию логи пишутся в `logs/sync_YYYY-MM-DD.log` и в консоль. Можно переопределить `--log-level` и `--log-file`.
-
----
-
-## CLI
-
-```text
-init-db                — создать/инициализировать SQLite
-import-all             — полный импорт из ABCP
-import-today           — импорт только «сегодняшних»
-sync-b24 [--limit N]   — синхронизация в Bitrix24 (опциональный лимит)
-run                    — import-all + sync-b24 (полный цикл)
-
-Глобальные флаги:
-  --log-level (DEBUG/INFO/...), --log-file (путь к файлу), -v/--verbose
-```
-
-Примеры:
+Инициализация БД:
 
 ```bash
-python cli.py import-all --log-level INFO
-python cli.py sync-b24 --limit 100 --log-level DEBUG
-python cli.py run --log-file logs/custom.log
+python cli.py init-db
 ```
 
----
+Полный импорт из ABCP:
 
-## Переменные окружения (`.env`)
+```bash
+python cli.py import-all
+```
 
-### ABCP
+Инкрементальный импорт по окну изменений:
+
+```bash
+python cli.py import-incremental
+```
+
+Старый алиас команды тоже оставлен:
+
+```bash
+python cli.py import-today
+```
+
+Синхронизация в Bitrix24:
+
+```bash
+python cli.py sync-b24
+```
+
+Синхронизация с лимитом:
+
+```bash
+python cli.py sync-b24 --limit 100
+```
+
+Полный цикл вручную:
+
+```bash
+python cli.py run
+```
+
+## Регулярный запуск
+
+Основной daemon-режим:
+
+```bash
+python main.py
+```
+
+Что делает `main.py`:
+
+- проверяет конфиг;
+- поднимает SQLite;
+- если полного импорта ещё не было, делает его один раз;
+- затем запускает бесконечный цикл:
+  - `import-incremental`
+  - `sync-b24`
+
+Интервал по умолчанию:
 
 ```text
-ABCP_BASE_URL     — базовый URL (без параметров), напр. https://abcpXXXX.public.api.abcp.ru/cp/users
-ABCP_USERLOGIN    — логин API
-ABCP_USERPSW      — пароль/ключ API
-ABCP_LIMIT        — размер страницы (по умолчанию 500)
-ABCP_MAX_PAGES    — максимум страниц (целое; пусто — без лимита)
+SYNC_INTERVAL_SECONDS=600
 ```
 
-### Bitrix24
+Это 10 минут. Если нужно, можно изменить в `.env`.
+
+Для Linux есть обёртка:
+
+```bash
+./scripts/run_service.sh
+```
+
+Скрипт просто выставляет интервал по умолчанию и запускает `main.py`.
+
+## Как запускать с нуля
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+python cli.py init-db
+python cli.py import-all
+python cli.py sync-b24
+python main.py
+```
+
+### Linux
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python cli.py init-db
+python cli.py import-all
+python cli.py sync-b24
+python main.py
+```
+
+## Логи
+
+### Логи daemon-режима
+
+`main.py` пишет в:
 
 ```text
-B24_WEBHOOK_URL           — URL вебхука Bitrix24 вида https://{domain}.bitrix24.ru/rest/{user_id}/{token}/
-B24_DEAL_TITLE_PREFIX     — префикс названия сделки (по умолчанию "ABCP Регистрация:")
+logs/service.log
 ```
 
-### Воронка «Пользователи»
+После ротации остаются файлы вида:
 
 ```text
-B24_DEAL_CATEGORY_ID_USERS — числовой CATEGORY_ID воронки (обязательно)
-B24_DEAL_STAGE_NEW_USERS   — код стартовой стадии (обязательно), формат C{CATEGORY_ID}:NEW
-# пример: если CATEGORY_ID=5 → B24_DEAL_STAGE_NEW_USERS=C5:NEW
+logs/service.log.YYYY-MM-DD
 ```
 
-### UF-поля сделки
+Смотреть логи в PowerShell:
+
+```powershell
+Get-Content .\logs\service.log -Wait
+```
+
+Смотреть последние строки:
+
+```powershell
+Get-Content .\logs\service.log -Tail 100
+```
+
+Смотреть логи в Linux:
+
+```bash
+tail -f logs/service.log
+```
+
+### Логи CLI-команд
+
+CLI по умолчанию пишет в файл:
 
 ```text
-UF_B24_DEAL_ABCP_USER_ID  — код UF для «ID клиента ABCP» (например, UF_CRM_1738181468)
-UF_B24_DEAL_INN           — код UF для «ИНН» (например, UF_CRM_1713393074421)
-UF_B24_DEAL_SALDO         — код UF для «Баланс ABCP» (например, UF_CRM_1738182431)
+logs/sync_YYYY-MM-DD.log
 ```
 
-### Хранилище
+Пример просмотра в PowerShell:
+
+```powershell
+Get-Content .\logs\sync_2026-03-25.log -Tail 100 -Wait
+```
+
+Пример просмотра в Linux:
+
+```bash
+tail -f logs/sync_$(date +%F).log
+```
+
+Можно указать свой файл:
+
+```bash
+python cli.py --log-level INFO --log-file logs/manual_sync.log sync-b24
+```
+
+## Конфигурация
+
+Все рабочие переменные перечислены в `.env.example`.
+
+Ключевые настройки:
 
 ```text
-SQLITE_PATH               — путь к БД SQLite (по умолчанию data/abcp_b24.sqlite3)
+ABCP_BASE_URL
+ABCP_USERLOGIN
+ABCP_USERPSW
+ABCP_LIMIT
+ABCP_INCREMENTAL_LOOKBACK_MINUTES
+ABCP_INCREMENTAL_OVERLAP_MINUTES
+
+B24_WEBHOOK_URL
+B24_DEAL_CATEGORY_ID_USERS
+B24_DEAL_STAGE_NEW_USERS
+
+UF_B24_DEAL_ABCP_USER_ID
+UF_B24_DEAL_INN
+UF_B24_DEAL_SALDO
+UF_B24_DEAL_REG_DATE
+UF_B24_DEAL_UPDATE_TIME
+
+SQLITE_PATH
+SYNC_INTERVAL_SECONDS
 ```
 
-### HTTP
+Рекомендуемые значения для регулярной работы:
 
 ```text
-REQUESTS_TIMEOUT          — таймаут запроса в секундах (по умолчанию 20)
-REQUESTS_RETRIES          — количество повторов при ошибках (по умолчанию 3)
-REQUESTS_RETRY_BACKOFF    — базовая задержка между повторами (сек; по умолчанию 1.5)
-RATE_LIMIT_SLEEP          — пауза между запросами (сек; минимум 3.0; по умолчанию 3.0)
+ABCP_INCREMENTAL_LOOKBACK_MINUTES=15
+ABCP_INCREMENTAL_OVERLAP_MINUTES=5
+SYNC_INTERVAL_SECONDS=600
+RATE_LIMIT_SLEEP=3
 ```
 
----
+## Поведение Bitrix24
 
-## Модель данных
+Сервис не должен плодить дубли при нормальной работе, потому что:
 
-### Таблица `users`
+- контакт переиспользуется по `b24_contact_id`, а при первом создании ищется по телефону/email;
+- сделка переиспользуется по `b24_deal_id`;
+- если локальная БД потеряна, сделка дополнительно ищется по `UF_B24_DEAL_ABCP_USER_ID`.
 
-```text
-id (PK, autoincrement)
-abcp_user_id (уникально, индекс)
-name, second_name, surname, email (индекс), mobile (индекс), phone, city, state
-registration_date, update_time (строки)
-raw_json (оригинальный JSON пользователя)
-synced (bool, индекс), synced_at (datetime), b24_contact_id, b24_deal_id
-created_at, updated_at
-```
+## Проверка состояния
 
-### Таблица `meta`
-
-```text
-key (PK), value
-# используется для: last_full_import_at, last_incremental_import_at
-```
-
----
-
-## Поведение синхронизации
-
-- **Контакт** создаётся быстро через вебхук (`crm.contact.add`) без предварительного поиска. Если у записи в БД уже есть `b24_contact_id`, он переиспользуется.
-- **Сделка** создаётся в воронке «Пользователи» со следующими полями:
-  - `TITLE` = `organizationName` (либо `{B24_DEAL_TITLE_PREFIX} {userId}`);
-  - `CATEGORY_ID` = `B24_DEAL_CATEGORY_ID_USERS`;
-  - `STAGE_ID` = `B24_DEAL_STAGE_NEW_USERS`;
-  - `CONTACT_ID` = ID созданного/существующего контакта.
-- **UF-поля сделки**:
-  - `UF_CRM_… (ABCP_USER_ID)` ← `userId`;
-  - `UF_CRM_… (ИНН)` ← `inn`;
-  - `UF_CRM_… (Баланс ABCP)` ← `saldo` (строка вида `-1 582,00` парсится в `float`; если парсинг не удался, передаётся исходная строка).
-
-После успешного создания сделки запись помечается `synced=True`, сохраняются `b24_deal_id` и `synced_at`.
-
-> Примечание: при отсутствии телефона/почты в новых источниках возможны дубляжи контактов. После первого создания мы сохраняем `b24_contact_id` и далее его переиспользуем.
-
----
-
-## Логирование
-
-- По умолчанию логи пишутся в **консоль** и в файл за текущую дату:
-
-  ```text
-  logs/sync_YYYY-MM-DD.log
-  ```
-
-- Уровень логирования задаётся `--log-level` (по умолчанию `DEBUG`) или флагом `-v/--verbose`.
-- Можно указать собственный файл логов: `--log-file logs/custom.log`.
-
----
-
-## Проверка и диагностика
-
-### Как узнать путь к БД
+Сколько записей в локальной базе и есть ли очередь на синк:
 
 ```bash
 python - << 'PY'
 from config import SQLITE_PATH
-print("SQLITE_PATH =", SQLITE_PATH)
+from db import get_engine, User
+from sqlalchemy.orm import Session
+
+engine = get_engine(SQLITE_PATH)
+with Session(engine) as session:
+    total = session.query(User).count()
+    unsynced = session.query(User).filter(User.synced == False).count()
+    print("total =", total)
+    print("unsynced =", unsynced)
 PY
 ```
 
-### Как убедиться, что таблицы созданы
+## Эксплуатационная документация
 
-```bash
-python - << 'PY'
-from sqlalchemy import create_engine, inspect
-from config import SQLITE_PATH
-eng = create_engine(f"sqlite:///{SQLITE_PATH}")
-print(inspect(eng).get_table_names())
-PY
-```
+Подробные инструкции по запуску и сопровождению:
 
-Ожидается минимум: `['meta', 'users']`.
-
-> В коде `sync_service` перед операциями вызывается `init_db()` — схема будет создана автоматически, но явный `init-db` полезен для первичного развёртывания.
-
----
-
-## Планировщики
-
-### Linux (cron)
-
-```cron
-# ежедневный инкремент + синхронизация (02:10), с логом по умолчанию
-10 2 * * * /path/to/.venv/bin/python /path/to/cli.py import-today && /path/to/.venv/bin/python /path/to/cli.py sync-b24
-```
-
-### Windows (Task Scheduler)
-
-```text
-Program/script:   C:\Path\to\python.exe
-Add arguments:    C:\Path\to\project\cli.py import-today
-Start in:         C:\Path\to\project
-# создайте второе действие для sync-b24
-```
-
----
+[docs/OPERATIONS.md](docs/OPERATIONS.md)
 
 ## Безопасность
 
-- Храните реальные ключи в `.env` (файл не коммитится; в репозитории только `.env.example`).
-- Логи могут содержать технические идентификаторы; пароли/токены не логируются.
-- SQLite-файл храните на защищённом диске/разделе.
-
----
-
-## Частые вопросы (FAQ)
-
-### Ошибка `no such table: users`
-
-```text
-Выполните: python cli.py init-db
-(в актуальной версии init_db() вызывается автоматически, но первый запуск лучше делать явно)
-```
-
-### Нужно ли заполнять CATEGORY_ID и STAGE_ID?
-
-```text
-Да. Это обязательные параметры для воронки «Пользователи». Пример: CATEGORY_ID=5 → C5:NEW
-```
-
-### Как формируется баланс?
-
-```text
-Поле saldo, например "-1 582,00", парсится в -1582.00 (float). Если парсинг не удался — отправляется исходной строкой.
-```
+- `.env` не коммитится.
+- В репозиторий попадает только `.env.example`.
+- SQLite-файл тоже не коммитится.
+- В логах не должны появляться секреты webhook/API.

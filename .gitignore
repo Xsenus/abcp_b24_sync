@@ -17,6 +17,7 @@ venv/
 # --- IDE / Editor ---
 .vscode/
 .idea/
+.vs/
 *.code-workspace
 
 # --- OS мусор ---
