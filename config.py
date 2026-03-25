@@ -42,6 +42,8 @@ ABCP_USERPSW   = os.getenv("ABCP_USERPSW", "").strip()
 ABCP_LIMIT     = getenv_int("ABCP_LIMIT", 500)
 # Максимум страниц (int или None — без лимита)
 ABCP_MAX_PAGES = getenv_int("ABCP_MAX_PAGES", None)
+ABCP_INCREMENTAL_LOOKBACK_MINUTES = getenv_int("ABCP_INCREMENTAL_LOOKBACK_MINUTES", 15)
+ABCP_INCREMENTAL_OVERLAP_MINUTES = getenv_int("ABCP_INCREMENTAL_OVERLAP_MINUTES", 5)
 
 # ------------------------ Bitrix24 ----------------------
 
@@ -152,7 +154,14 @@ def log_config(level: int = logging.DEBUG) -> None:
     logger.log(level, "ABCP_BASE_URL=%s", ABCP_BASE_URL or "(empty)")
     logger.log(level, "ABCP_USERLOGIN=%s", ABCP_USERLOGIN or "(empty)")
     logger.log(level, "ABCP_USERPSW=%s", _mask_secret(ABCP_USERPSW))
-    logger.log(level, "ABCP_LIMIT=%s, ABCP_MAX_PAGES=%s", ABCP_LIMIT, ABCP_MAX_PAGES)
+    logger.log(
+        level,
+        "ABCP_LIMIT=%s, ABCP_MAX_PAGES=%s, LOOKBACK_MIN=%s, OVERLAP_MIN=%s",
+        ABCP_LIMIT,
+        ABCP_MAX_PAGES,
+        ABCP_INCREMENTAL_LOOKBACK_MINUTES,
+        ABCP_INCREMENTAL_OVERLAP_MINUTES,
+    )
 
     # B24
     logger.log(level, "B24_WEBHOOK_URL=%s", _describe_webhook(B24_WEBHOOK_URL))

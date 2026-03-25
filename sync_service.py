@@ -13,19 +13,29 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Наши модули БД и клиентов
-from db import get_engine, init_db, User, upsert_user, set_meta
-from abcp_client import iter_all_users, iter_today_users
-from b24_client import add_or_update_contact_abcp, add_deal_with_fields, wipe_contact_fio  # + очистка ФИО
+from db import User, get_engine, get_meta, init_db, set_meta, upsert_users_batch
+from abcp_client import iter_all_users, iter_users_updated_between
+from b24_client import (
+    add_deal_with_fields,
+    add_or_update_contact_abcp,
+    find_deal_by_field,
+    update_contact_abcp,
+    update_deal_with_fields,
+)
 from config import (
     SQLITE_PATH, B24_DEAL_TITLE_PREFIX,             # путь к SQLite и дефолтный префикс для названия сделки
     B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS,  # настройки воронки «Пользователи»
     UF_B24_DEAL_ABCP_USER_ID, UF_B24_DEAL_INN, UF_B24_DEAL_SALDO,  # UF-поля сделки
     UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME,
-    ABCP_TIMEZONE, B24_OUT_TZ_ISO
+    ABCP_TIMEZONE, B24_OUT_TZ_ISO,
+    ABCP_INCREMENTAL_LOOKBACK_MINUTES, ABCP_INCREMENTAL_OVERLAP_MINUTES,
 )
 
 # Модульный логгер
 logger = logging.getLogger(__name__)
+
+IMPORT_BATCH_SIZE = 500
+INCREMENTAL_WINDOW_END_META_KEY = "last_incremental_window_end"
 
 
 def _fmt_user(u: User) -> str:
@@ -38,6 +48,28 @@ def _fmt_user(u: User) -> str:
         f"email={u.email!r}, mobile={u.mobile!r}, phone={u.phone!r}, city={u.city!r}, "
         f"registration_date={u.registration_date!r}, state={u.state!r}"
     )
+
+
+def _flush_import_batch(session: Session, batch: list[Dict[str, Any]], *, first_index: int, last_index: int) -> None:
+    if not batch:
+        return
+
+    try:
+        upsert_users_batch(session, batch)
+        session.commit()
+        logger.info("Import: committed rows %d-%d", first_index, last_index)
+    except Exception as exc:
+        session.rollback()
+        logger.exception("Import: batch %d-%d failed, falling back to row-by-row mode: %s", first_index, last_index, exc)
+
+        for offset, item in enumerate(batch):
+            row_index = first_index + offset
+            try:
+                upsert_users_batch(session, [item])
+                session.commit()
+            except Exception as row_exc:
+                session.rollback()
+                logger.exception("Import: failed row #%d: %s", row_index, row_exc)
 
 
 def import_users(items: Iterable[Dict[str, Any]], *, label: str) -> int:
@@ -57,6 +89,8 @@ def import_users(items: Iterable[Dict[str, Any]], *, label: str) -> int:
 
     # Одна сессия на всю операцию — меньше накладных расходов
     with Session(engine) as session:
+        batch: list[Dict[str, Any]] = []
+
         for item in items:
             try:
                 count += 1
@@ -66,21 +100,31 @@ def import_users(items: Iterable[Dict[str, Any]], *, label: str) -> int:
                 logger.debug("Импорт: сырой JSON #%d: %s", count, item)
 
                 # UPSERT пользователя по abcp_user_id
-                u = upsert_user(session, item)
-                logger.debug("Импорт: upsert %s", _fmt_user(u))
+                batch.append(item)
+                logger.debug("Import: queued row #%d for batch upsert", count)
 
                 # Периодически фиксируем транзакцию, чтобы не копить слишком много в памяти
-                if count % 500 == 0:
-                    session.commit()
-                    logger.info("Импорт: промежуточный COMMIT после %d записей", count)
+                if len(batch) >= IMPORT_BATCH_SIZE:
+                    _flush_import_batch(
+                        session,
+                        batch,
+                        first_index=count - len(batch) + 1,
+                        last_index=count,
+                    )
+                    batch.clear()
             except Exception as e:
                 # Любая ошибка по записи — логируем и откатываем, продолжаем
                 logger.exception("Импорт: ошибка на записи #%d: %s", count, e)
                 session.rollback()
 
         # Финальный COMMIT по хвосту
-        session.commit()
-        logger.info("Импорт: финальный COMMIT, всего записей: %d", count)
+        if batch:
+            _flush_import_batch(
+                session,
+                batch,
+                first_index=count - len(batch) + 1,
+                last_index=count,
+            )
 
         # Обновляем метку в meta: last_{label}_import_at=UTC now
         set_meta(session, f"last_{label}_import_at", datetime.utcnow().isoformat())
@@ -95,14 +139,112 @@ def import_all() -> int:
     """
     Полный импорт всех пользователей ABCP (постранично).
     """
-    return import_users(iter_all_users(), label="full")
+    started_at = datetime.now(timezone.utc)
+    count = import_users(iter_all_users(), label="full")
+
+    engine = get_engine(SQLITE_PATH)
+    with Session(engine) as session:
+        set_meta(session, "last_full_import_started_at", started_at.isoformat())
+        set_meta(session, INCREMENTAL_WINDOW_END_META_KEY, started_at.isoformat())
+        session.commit()
+
+    return count
+
+
+def _parse_meta_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except Exception:
+        logger.warning("Incremental import: invalid checkpoint datetime %r", value)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _truncate_seconds(value: datetime) -> datetime:
+    return value.replace(microsecond=0)
+
+
+def _resolve_incremental_window(now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    abcp_tz = _tz_from_str(ABCP_TIMEZONE or "Europe/Moscow")
+    window_end = _truncate_seconds(now.astimezone(abcp_tz) if now is not None else datetime.now(abcp_tz))
+
+    init_db(SQLITE_PATH)
+    engine = get_engine(SQLITE_PATH)
+    with Session(engine) as session:
+        checkpoint = _parse_meta_dt(get_meta(session, INCREMENTAL_WINDOW_END_META_KEY))
+        if checkpoint is None:
+            checkpoint = _parse_meta_dt(get_meta(session, "last_full_import_started_at"))
+        if checkpoint is None:
+            checkpoint = _parse_meta_dt(get_meta(session, "last_full_import_at"))
+
+    lookback_minutes = max(int(ABCP_INCREMENTAL_LOOKBACK_MINUTES or 15), 1)
+    overlap_minutes = max(int(ABCP_INCREMENTAL_OVERLAP_MINUTES or 5), 0)
+
+    if checkpoint is None:
+        base_start = window_end - timedelta(minutes=lookback_minutes)
+    else:
+        base_start = checkpoint.astimezone(abcp_tz)
+
+    window_start = _truncate_seconds(base_start - timedelta(minutes=overlap_minutes))
+    if window_start > window_end:
+        window_start = window_end
+
+    logger.info(
+        "Incremental import window resolved: start=%s, end=%s, checkpoint=%s, lookback_min=%s, overlap_min=%s",
+        window_start.isoformat(),
+        window_end.isoformat(),
+        checkpoint.isoformat() if checkpoint is not None else None,
+        lookback_minutes,
+        overlap_minutes,
+    )
+    return window_start, window_end
+
+
+def _iter_incremental_users(window_start: datetime, window_end: datetime) -> Iterable[Dict[str, Any]]:
+    seen_user_ids: set[str] = set()
+
+    for label, iterator in (
+        ("updated", iter_users_updated_between(window_start, window_end)),
+    ):
+        for item in iterator:
+            user_id = str(item.get("userId") or item.get("userID") or item.get("id") or "").strip()
+            if not user_id:
+                logger.warning("Incremental import: skip %s item without userId", label)
+                continue
+            if user_id in seen_user_ids:
+                logger.debug("Incremental import: duplicate %s userId=%s skipped", label, user_id)
+                continue
+            seen_user_ids.add(user_id)
+            yield item
+
+
+def import_incremental(now: Optional[datetime] = None) -> int:
+    """
+    Инкрементальный импорт по серверным окнам регистрации и обновления.
+    """
+    window_start, window_end = _resolve_incremental_window(now=now)
+    count = import_users(_iter_incremental_users(window_start, window_end), label="incremental")
+
+    engine = get_engine(SQLITE_PATH)
+    with Session(engine) as session:
+        set_meta(session, INCREMENTAL_WINDOW_END_META_KEY, window_end.isoformat())
+        session.commit()
+
+    logger.info("Incremental import checkpoint saved: %s", window_end.isoformat())
+    return count
 
 
 def import_today(today: Optional[date] = None) -> int:
     """
-    Инкрементальный импорт: только зарегистрированные «сегодня».
+    Совместимый алиас для старой команды import-today.
     """
-    return import_users(iter_today_users(today=today), label="incremental")
+    if today is not None:
+        logger.info("import_today(%s) redirected to checkpoint-based incremental import", today.isoformat())
+    return import_incremental()
 
 
 def _parse_money_ru(s: Optional[str]) -> Optional[float]:
@@ -264,6 +406,26 @@ def _safe_add_or_update_contact(name: str,
             return None
 
 
+def _safe_update_contact(contact_id: int,
+                         name: str,
+                         phone: Optional[str],
+                         email: Optional[str],
+                         comment: str,
+                         *,
+                         inn: Optional[str] = None) -> bool:
+    try:
+        update_contact_abcp(contact_id, name, phone, email, comment, inn=inn)
+        return True
+    except Exception as e1:
+        logger.warning("Контакт: ошибка при update (с email): %s — пробую без EMAIL", e1)
+        try:
+            update_contact_abcp(contact_id, name, phone, None, comment, inn=inn)
+            return True
+        except Exception as e2:
+            logger.error("Контакт: не удалось обновить даже без EMAIL: %s", e2)
+            return False
+
+
 def sync_to_b24(limit: Optional[int] = None) -> int:
     """
     Синхронизирует несинхронизированные записи в Bitrix24:
@@ -283,6 +445,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
     # Подключение к SQLite
     engine = get_engine(SQLITE_PATH)
     synced = 0
+    processed = 0
     logger.info("Синхронизация в Bitrix24: старт (limit=%s)", limit)
 
     with Session(engine) as session:
@@ -291,18 +454,16 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
         if limit:
             q = q.limit(limit)
 
-        # Материализуем выборку в «пакет» для логирования общего количества
         batch = list(q)
         logger.info("Синхронизация: к обработке %d записей", len(batch))
 
-        # Если обрабатывать нечего — выходим раньше
         if not batch:
             logger.info("Синхронизация: нет записей для обработки (synced=false).")
             return 0
 
-        # Проходим по каждой записи
         for idx, u in enumerate(batch, start=1):
-            logger.info("Синхронизация: #%d → %s", idx, _fmt_user(u))
+            processed = idx
+            logger.info("Синхронизация: #%d -> %s", idx, _fmt_user(u))
 
             # Извлекаем исходный JSON, чтобы подобрать дополнительные поля
             try:
@@ -336,14 +497,17 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             )
 
             # Контакт: создаём/обновляем, если нет привязки
+            comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
             if u.b24_contact_id:
                 contact_id = int(u.b24_contact_id)
                 logger.debug("B24: reuse contact_id=%s из БД", contact_id)
+                if not _safe_update_contact(contact_id, contact_name, phone, email, comment, inn=inn):
+                    session.rollback()
+                    logger.warning("Синхронизация: #%d пропущена (контакт не обновлён) — abcp_user_id=%s", idx, abcp_user_id)
+                    continue
             else:
-                comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
-
                 logger.debug(
-                    "B24: add_or_update_contact_abcp → START; NAME=%r, has_phone=%s, has_email=%s",
+                    "B24: add_or_update_contact_abcp -> START; NAME=%r, has_phone=%s, has_email=%s",
                     contact_name, bool(phone), bool(email)
                 )
 
@@ -362,7 +526,6 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
 
             # Явно очищаем LAST_NAME/SECOND_NAME у контакта (идемпотентно; если уже пусто — ничего не делает)
             # Важно: это не затирает NAME (organizationName), затрагиваются только фамилия/отчество.
-            wipe_contact_fio(int(contact_id))
 
             # Готовим поля сделки (воронка «Пользователи»)
             fields: Dict[str, Any] = {
@@ -388,16 +551,30 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 fields[UF_B24_DEAL_UPDATE_TIME] = upd_val
 
             logger.debug(
-                "B24: add_deal_with_fields → START; title=%r, CATEGORY_ID=%r, STAGE_ID=%r, CONTACT_ID=%r, UF_keys=%s",
+                "B24: add_deal_with_fields -> START; title=%r, CATEGORY_ID=%r, STAGE_ID=%r, CONTACT_ID=%r, UF_keys=%s",
                 title, B24_DEAL_CATEGORY_ID_USERS, B24_DEAL_STAGE_NEW_USERS, contact_id,
                 [k for k in fields.keys() if str(k).startswith("UF_")]
             )
 
             try:
-                deal_id = add_deal_with_fields(fields)
-                logger.info("B24: сделка создана (воронка «Пользователи», TITLE=%r), deal_id=%s", title, deal_id)
+                if u.b24_deal_id:
+                    deal_id = int(u.b24_deal_id)
+                    update_deal_with_fields(deal_id, fields)
+                    logger.info("B24: сделка обновлена (TITLE=%r), deal_id=%s", title, deal_id)
+                else:
+                    existing_deal_id = find_deal_by_field(
+                        UF_B24_DEAL_ABCP_USER_ID,
+                        abcp_user_id,
+                        category_id=B24_DEAL_CATEGORY_ID_USERS,
+                    )
+                    deal_id = existing_deal_id or add_deal_with_fields(fields)
+                    if existing_deal_id is not None:
+                        update_deal_with_fields(deal_id, fields)
+                        logger.info("B24: найдена существующая сделка и обновлена (TITLE=%r), deal_id=%s", title, deal_id)
+                    else:
+                        logger.info("B24: сделка создана (воронка «Пользователи», TITLE=%r), deal_id=%s", title, deal_id)
+                    u.b24_deal_id = str(deal_id)
 
-                u.b24_deal_id = str(deal_id)
                 u.synced = True
                 u.synced_at = datetime.utcnow()
                 session.commit()
@@ -408,10 +585,10 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                 )
             except Exception as e:
                 logger.error(
-                    "Синхронизация: #%d ошибка создания сделки для abcp_user_id=%s: %s",
+                    "Синхронизация: #%d ошибка синхронизации сделки для abcp_user_id=%s: %s",
                     idx, abcp_user_id, e
                 )
                 session.rollback()
 
-    logger.info("Синхронизация завершена: успешно %d из %d", synced, len(batch))
+    logger.info("Синхронизация завершена: успешно %d из %d", synced, processed)
     return synced

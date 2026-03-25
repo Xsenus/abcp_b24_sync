@@ -16,7 +16,7 @@ import time
 import signal
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, date
+from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import find_dotenv
@@ -25,11 +25,11 @@ from config import assert_config, SQLITE_PATH
 from db import init_db, get_engine, get_meta, set_meta
 from sqlalchemy.orm import Session
 
-from sync_service import import_all, import_today, sync_to_b24
+from sync_service import import_all, import_incremental, sync_to_b24
 
 # ---------- настройки ----------
 ENV_SYNC_INTERVAL = "SYNC_INTERVAL_SECONDS"
-DEFAULT_INTERVAL = 1  # сек
+DEFAULT_INTERVAL = 600  # сек
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_DIR = "logs"
@@ -81,8 +81,10 @@ def _full_import_done(session: Session) -> bool:
     return bool(ts)
 
 
-def _mark_full_import(session: Session) -> None:
-    set_meta(session, "last_full_import_at", datetime.utcnow().isoformat())
+def _mark_full_import(session: Session, *, started_at: datetime) -> None:
+    set_meta(session, "last_full_import_started_at", started_at.isoformat())
+    set_meta(session, "last_full_import_at", datetime.now(timezone.utc).isoformat())
+    set_meta(session, "last_incremental_window_end", started_at.isoformat())
     session.commit()
 
 
@@ -112,10 +114,11 @@ def run_daemon() -> None:
     with Session(get_engine(SQLITE_PATH)) as session:
         if not _full_import_done(session):
             logging.info("Initial full import: start")
+            full_import_started_at = datetime.now(timezone.utc)
             try:
                 cnt = import_all()
                 logging.info("Initial full import: done, users=%d", cnt)
-                _mark_full_import(session)
+                _mark_full_import(session, started_at=full_import_started_at)
             except Exception:
                 logging.exception("Initial full import FAILED")
                 # продолжаем — в цикле пойдёт инкрементальная загрузка
@@ -127,9 +130,9 @@ def run_daemon() -> None:
     while not _stop:
         started = time.perf_counter()
         try:
-            logging.info("Tick: import_today")
-            cnt_i = import_today(today=date.today())
-            logging.info("Tick: import_today done, users=%d", cnt_i)
+            logging.info("Tick: import_incremental")
+            cnt_i = import_incremental()
+            logging.info("Tick: import_incremental done, users=%d", cnt_i)
 
             logging.info("Tick: sync_to_b24")
             cnt_s = sync_to_b24()

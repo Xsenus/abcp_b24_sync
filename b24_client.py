@@ -3,6 +3,7 @@ import logging
 import time
 import re
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Any, Optional, Dict, List
 
 from config import (
@@ -14,6 +15,11 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+_HTTP = requests.Session()
+_HTTP.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0))
+_HTTP.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0))
+_CONTACT_LOOKUP_CACHE: Dict[tuple[str, str], int] = {}
 
 # -------------------------
 # Утилиты нормализации
@@ -64,6 +70,22 @@ def _normalize_inn(inn: Optional[str]) -> Optional[str]:
         return digits
     return None
 
+
+def _contact_lookup_keys(phone: Optional[str], email: Optional[str]) -> List[tuple[str, str]]:
+    keys: List[tuple[str, str]] = []
+    n_phone = _normalize_phone(phone)
+    n_email = _normalize_email(email)
+    if n_phone:
+        keys.append(("PHONE", n_phone))
+    if n_email:
+        keys.append(("EMAIL", n_email))
+    return keys
+
+
+def _remember_contact_lookup(contact_id: int, phone: Optional[str], email: Optional[str]) -> None:
+    for key in _contact_lookup_keys(phone, email):
+        _CONTACT_LOOKUP_CACHE[key] = contact_id
+
 # -------------------------
 # Базовые вызовы
 # -------------------------
@@ -89,7 +111,7 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = B24_WEBHOOK_URL.rstrip("/") + "/" + method
 
     def do() -> Dict[str, Any]:
-        r = requests.post(url, json=params, timeout=REQUESTS_TIMEOUT)
+        r = _HTTP.post(url, json=params, timeout=REQUESTS_TIMEOUT)
         # Пытаемся всегда разобрать JSON — даже на 4xx, чтобы достать описание
         try:
             data: Any = r.json()
@@ -240,19 +262,44 @@ def add_contact_quick(
         raise
 
 
+def update_contact_abcp(
+    contact_id: int,
+    organization_name: Optional[str],
+    phone: Optional[str],
+    email: Optional[str],
+    comment: str,
+    *,
+    inn: Optional[str] = None,
+) -> int:
+    fields = _build_contact_fields(
+        name=organization_name or "",
+        phone=phone,
+        email=email,
+        comment=comment,
+        inn=inn,
+        force_blank_fio=True,
+    )
+    log.info(
+        "B24 CONTACT UPDATE (ABCP direct): id=%s, has_phone=%s, has_email=%s, has_inn=%s",
+        contact_id, bool(fields.get("PHONE")), bool(fields.get("EMAIL")), bool(fields.get("UF_CRM_1759218031")),
+    )
+    _call("crm.contact.update", {"id": contact_id, "fields": fields})
+    _remember_contact_lookup(contact_id, phone, email)
+    return contact_id
+
+
 def find_contact_by_phone_or_email(phone: Optional[str], email: Optional[str]) -> Optional[int]:
     """
     Ищем контакт по телефону/почте. Пробуем нормализованные значения.
     Возвращаем ID первого найденного контакта, иначе None.
     """
     queries: List[Dict[str, Any]] = []
-    n_phone = _normalize_phone(phone)
-    n_email = _normalize_email(email)
-
-    if n_phone:
-        queries.append({"filter": {"PHONE": n_phone}, "select": ["ID"]})
-    if n_email:
-        queries.append({"filter": {"EMAIL": n_email}, "select": ["ID"]})
+    for key in _contact_lookup_keys(phone, email):
+        cached = _CONTACT_LOOKUP_CACHE.get(key)
+        if cached is not None:
+            log.debug("B24 CONTACT CACHE HIT: %s -> id=%s", key, cached)
+            return cached
+        queries.append({"filter": {key[0]: key[1]}, "select": ["ID"]})
 
     for q in queries:
         data = _call("crm.contact.list", q)
@@ -263,6 +310,7 @@ def find_contact_by_phone_or_email(phone: Optional[str], email: Optional[str]) -
                 try:
                     cid = _to_int(first["ID"])
                     log.debug("B24 CONTACT FOUND: %s -> id=%s", q["filter"], cid)
+                    _remember_contact_lookup(cid, phone, email)
                     return cid
                 except Exception:
                     continue
@@ -306,6 +354,7 @@ def add_or_update_contact(
         if contact_id is not None:
             log.info("B24 CONTACT UPDATE: id=%s, has_inn=%s", contact_id, bool(fields.get("UF_CRM_1759218031")))
             _update(contact_id, fields)
+            _remember_contact_lookup(contact_id, phone, email)
             return contact_id
         else:
             log.info(
@@ -313,7 +362,9 @@ def add_or_update_contact(
                 fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
                 bool(fields.get("UF_CRM_1759218031")),
             )
-            return _create(fields)
+            contact_id = _create(fields)
+            _remember_contact_lookup(contact_id, phone, email)
+            return contact_id
     except Exception as e:
         # --- Мягкая обработка «битого» e-mail для add/update ---
         if _is_bad_email_error(e) and "EMAIL" in fields:
@@ -322,9 +373,12 @@ def add_or_update_contact(
             fields_wo_email.pop("EMAIL", None)
             if contact_id is not None:
                 _update(contact_id, fields_wo_email)
+                _remember_contact_lookup(contact_id, phone, email)
                 return contact_id
             else:
-                return _create(fields_wo_email)
+                contact_id = _create(fields_wo_email)
+                _remember_contact_lookup(contact_id, phone, email)
+                return contact_id
         raise
 
 # -------------------------
@@ -405,6 +459,7 @@ def add_or_update_contact_abcp(
                 contact_id, bool(fields.get("UF_CRM_1759218031")),
             )
             _update(contact_id, fields)
+            _remember_contact_lookup(contact_id, phone, email)
             return contact_id
         else:
             log.info(
@@ -412,7 +467,9 @@ def add_or_update_contact_abcp(
                 fields.get("NAME"), bool(fields.get("PHONE")), bool(fields.get("EMAIL")),
                 bool(fields.get("UF_CRM_1759218031")),
             )
-            return _create(fields)
+            contact_id = _create(fields)
+            _remember_contact_lookup(contact_id, phone, email)
+            return contact_id
     except Exception as e:
         if _is_bad_email_error(e) and "EMAIL" in fields:
             log.warning("B24 CONTACT add/update (ABCP): bad email, retry without EMAIL; err=%s", e)
@@ -420,9 +477,12 @@ def add_or_update_contact_abcp(
             fields_wo_email.pop("EMAIL", None)
             if contact_id is not None:
                 _update(contact_id, fields_wo_email)
+                _remember_contact_lookup(contact_id, phone, email)
                 return contact_id
             else:
-                return _create(fields_wo_email)
+                contact_id = _create(fields_wo_email)
+                _remember_contact_lookup(contact_id, phone, email)
+                return contact_id
         raise
 
 # -------------------------
@@ -454,3 +514,32 @@ def add_deal_with_fields(fields: Dict[str, Any]) -> int:
     )
     data = _call("crm.deal.add", {"fields": fields})
     return _to_int(data.get("result"))
+
+
+def update_deal_with_fields(deal_id: int, fields: Dict[str, Any]) -> int:
+    log.info(
+        "B24 DEAL UPDATE (Users funnel): deal_id=%s, title=%r, has_contact=%s",
+        deal_id, fields.get("TITLE"), bool(fields.get("CONTACT_ID")),
+    )
+    _call("crm.deal.update", {"id": deal_id, "fields": fields})
+    return deal_id
+
+
+def find_deal_by_field(field_name: str, field_value: Any, *, category_id: Optional[int] = None) -> Optional[int]:
+    if field_value in (None, ""):
+        return None
+
+    filter_payload: Dict[str, Any] = {field_name: field_value}
+    if category_id is not None:
+        filter_payload["CATEGORY_ID"] = category_id
+
+    log.debug("B24 DEAL LOOKUP: filter=%s", filter_payload)
+    data = _call("crm.deal.list", {"filter": filter_payload, "select": ["ID"]})
+    result = data.get("result")
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict) and "ID" in first:
+            deal_id = _to_int(first["ID"])
+            log.debug("B24 DEAL FOUND: field=%s value=%r -> id=%s", field_name, field_value, deal_id)
+            return deal_id
+    return None

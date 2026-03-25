@@ -1,59 +1,43 @@
 # abcp_client.py
 
-# Импорт стандартного логгера
 import logging
-# Импорт функции задержки между запросами для бережного rate-limit
 import time
-# HTTP-клиент для вызова API ABCP
-import requests
-# Типы для аннотаций (итераторы, опциональные значения, словари)
-from typing import Iterator, Optional, Dict, Any
-# Тип даты для фильтрации «сегодня»
-from datetime import date
+from datetime import date, datetime, time as dt_time
+from typing import Any, Dict, Iterator, Optional
 
-# Импорт конфигурации из .env через наш модуль config
+import requests
+from requests.adapters import HTTPAdapter
+
 from config import (
-    ABCP_BASE_URL,            # базовый URL эндпоинта /cp/users
-    ABCP_USERLOGIN,           # логин для ABCP API
-    ABCP_USERPSW,             # пароль/ключ для ABCP API (НЕ логируем)
-    ABCP_LIMIT,               # размер страницы
-    ABCP_MAX_PAGES,           # ограничение количества страниц (может быть None)
-    REQUESTS_TIMEOUT,         # таймаут HTTP-запросов
-    REQUESTS_RETRIES,         # число повторов при ошибках
-    REQUESTS_RETRY_BACKOFF,   # коэффициент backoff между повторами
-    RATE_LIMIT_SLEEP,         # пауза между запросами
+    ABCP_BASE_URL,
+    ABCP_LIMIT,
+    ABCP_MAX_PAGES,
+    ABCP_USERLOGIN,
+    ABCP_USERPSW,
+    RATE_LIMIT_SLEEP,
+    REQUESTS_RETRIES,
+    REQUESTS_RETRY_BACKOFF,
+    REQUESTS_TIMEOUT,
 )
-# Универсальный помощник «с повторами» (экспоненциальный backoff реализуем в utils)
 from utils import with_retries
 
-# Инициализируем модульный логгер (имя = abcp_client)
 log = logging.getLogger(__name__)
 
-# -------- Локальные константы c жёсткими типами, чтобы убрать Optional для Pylance --------
+_HTTP = requests.Session()
+_HTTP.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0))
+_HTTP.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0))
 
-# Таймаут запроса как целое число (сек)
 _REQ_TIMEOUT: int = int(REQUESTS_TIMEOUT or 20)
-# Количество повторов как целое число
 _RETRIES: int = int(REQUESTS_RETRIES or 3)
-# Базовая задержка между повторами как float
 _BACKOFF: float = float(REQUESTS_RETRY_BACKOFF or 1.5)
-# Пауза между удачными запросами (rate-limit) как float
-# Минимальный интервал между запросами в секундах (ABCP требует ≥3 сек)
 _RATE_LIMIT_INTERVAL: float = max(float(RATE_LIMIT_SLEEP or 0.0), 3.0)
-# Лимит записей на страницу как целое число
 _LIMIT: int = int(ABCP_LIMIT or 500)
-# Максимум страниц — может быть None (тогда без лимита), иначе приводим к int
 _MAX_PAGES: Optional[int] = int(ABCP_MAX_PAGES) if ABCP_MAX_PAGES is not None else None
-
-# Защитный предел страниц при «сегодняшнем» обходе (чтобы не перебирать всё)
-_TODAY_MAX_PAGES: int = 5  # при необходимости вынесем в конфиг
-
 
 _last_request_ts: Optional[float] = None
 
 
 def _wait_rate_limit() -> None:
-    """Блокирует выполнение, чтобы обеспечить минимум 3 сек между запросами."""
     if _RATE_LIMIT_INTERVAL <= 0:
         return
 
@@ -70,7 +54,6 @@ def _wait_rate_limit() -> None:
 
 
 def _mark_request_complete() -> None:
-    """Фиксирует время завершения запроса для следующей паузы."""
     if _RATE_LIMIT_INTERVAL <= 0:
         return
 
@@ -78,257 +61,177 @@ def _mark_request_complete() -> None:
     _last_request_ts = time.monotonic()
 
 
-def _fetch_page(skip: int, limit: int) -> Dict[str, Any]:
-    """
-    Загружает одну страницу пользователей ABCP.
-    :param skip: смещение (сколько записей пропустить)
-    :param limit: размер страницы
-    :return: распарсенный JSON-словарь ответа
-    """
-    # Формируем query-параметры запроса (пароль НЕ логируем)
+def _format_abcp_datetime(value: datetime) -> str:
+    return value.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _build_params(skip: int, limit: int, extra_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {
-        "userlogin": ABCP_USERLOGIN,  # логин
-        "userpsw": ABCP_USERPSW,      # пароль (секрет)
-        "limit": limit,               # размер страницы
-        "skip": skip,                 # смещение
-        "format": "p",                # формат «p» согласно вашему примеру
+        "userlogin": ABCP_USERLOGIN,
+        "userpsw": ABCP_USERPSW,
+        "limit": limit,
+        "skip": skip,
+        "format": "p",
     }
+    for key, value in (extra_params or {}).items():
+        if value not in (None, ""):
+            params[key] = value
+    return params
 
-    # Отладочно фиксируем старт запроса (без секрета)
-    log.debug("ABCP GET %s?skip=%s&limit=%s&format=p&userlogin=%s",
-              ABCP_BASE_URL, skip, limit, ABCP_USERLOGIN)
 
-    # Внутренняя функция, непосредственно выполняющая HTTP-вызов
+def _safe_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in params.items() if k != "userpsw"}
+
+
+def _fetch_page(skip: int, limit: int, extra_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params = _build_params(skip=skip, limit=limit, extra_params=extra_params)
+    safe_params = _safe_params(params)
+    log.debug("ABCP GET %s params=%s", ABCP_BASE_URL, safe_params)
+
     def do() -> Dict[str, Any]:
         _wait_rate_limit()
         try:
-            # Выполняем GET на ABCP_BASE_URL с параметрами и таймаутом
-            r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
-            # Бросаем исключение при HTTP-ошибке (4xx/5xx)
-            r.raise_for_status()
-            # Пытаемся распарсить JSON
-            data = r.json()
-            # Проверяем тип, ожидаем словарь (dict)
+            response = _HTTP.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
             if not isinstance(data, dict):
                 raise RuntimeError(f"Unexpected ABCP response type: {type(data)}")
-            # Возвращаем распарсенный JSON
             return data
         finally:
             _mark_request_complete()
 
-    # Вызываем do() с повторами при ошибках (retries/backoff настроены в константах выше)
     data = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
-
-    # Логируем успешный ответ на уровне DEBUG с краткой сводкой
     items = data.get("items")
-    log.debug("ABCP page fetched: skip=%s, limit=%s, items_count=%s",
-              skip, limit, (len(items) if isinstance(items, list) else "n/a"))
-
-    # Возвращаем тело ответа
+    log.debug(
+        "ABCP page fetched: skip=%s, limit=%s, items_count=%s, filters=%s",
+        skip,
+        limit,
+        len(items) if isinstance(items, list) else "n/a",
+        {k: v for k, v in safe_params.items() if k not in {"userlogin", "limit", "skip", "format"}},
+    )
     return data
 
-def _fetch_count() -> int:
-    """
-    Получает общее количество записей (count) одной лёгкой выборкой:
-    GET /cp/users?limit=0&skip=0&format=p&userlogin=...&userpsw=...
-    """
-    params: Dict[str, Any] = {
-        "userlogin": ABCP_USERLOGIN,
-        "userpsw": ABCP_USERPSW,
-        "limit": 0,
-        "skip": 0,
-        "format": "p",
-    }
 
-    log.debug("ABCP COUNT %s?limit=0&skip=0&format=p&userlogin=%s", ABCP_BASE_URL, ABCP_USERLOGIN)
+def _fetch_count(extra_params: Optional[Dict[str, Any]] = None) -> int:
+    params = _build_params(skip=0, limit=0, extra_params=extra_params)
+    log.debug("ABCP COUNT %s params=%s", ABCP_BASE_URL, _safe_params(params))
 
     def do() -> int:
         _wait_rate_limit()
         try:
-            r = requests.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
+            response = _HTTP.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
             if not isinstance(data, dict) or "count" not in data:
                 raise RuntimeError("ABCP count response has no 'count'")
-            try:
-                return int(str(data["count"]))
-            except Exception as e:
-                raise RuntimeError(f"ABCP count is not int-like: {data.get('count')!r}") from e
+            return int(str(data["count"]))
         finally:
             _mark_request_complete()
 
-    cnt = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
-    log.info("ABCP total count: %s", cnt)
-    return cnt
+    count = with_retries(do, retries=_RETRIES, backoff=_BACKOFF)
+    log.info("ABCP total count: %s", count)
+    return count
 
-def iter_all_users() -> Iterator[Dict[str, Any]]:
-    """
-    Итерирует по всем пользователям ABCP постранично.
-    :yield: словарь пользователя (как в JSON ABCP)
-    """
-    # Начальное смещение
+
+def _iter_users(
+    *,
+    extra_params: Optional[Dict[str, Any]] = None,
+    label: str,
+    max_pages: Optional[int] = _MAX_PAGES,
+) -> Iterator[Dict[str, Any]]:
     skip = 0
-    # Номер страницы (для лога/ограничения)
     page = 0
-    # Размер страницы, фиксируем один раз локально
     limit = _LIMIT
+    safe_filters = {
+        k: v
+        for k, v in (extra_params or {}).items()
+        if v not in (None, "")
+    }
 
-    # Информируем о старте общей итерации по всем пользователям
-    log.info("ABCP iterate all users: start, limit=%s, max_pages=%s", limit, _MAX_PAGES)
+    log.info(
+        "ABCP iterate %s: start, limit=%s, max_pages=%s, filters=%s",
+        label,
+        limit,
+        max_pages,
+        safe_filters or "{}",
+    )
 
-    # Бесконечный цикл, прервёмся по пустой странице или достижении лимита страниц
     while True:
-        # Если задан максимум страниц и мы его достигли — выходим
-        if _MAX_PAGES is not None and page >= _MAX_PAGES:
-            log.warning("ABCP_MAX_PAGES reached at page=%s, stopping.", page)
+        if max_pages is not None and page >= max_pages:
+            log.warning("ABCP_MAX_PAGES reached at page=%s for %s, stopping.", page, label)
             break
 
-        # Загружаем страницу (skip/limit)
-        payload = _fetch_page(skip=skip, limit=limit)
-
-        # Извлекаем массив пользователей из ответа
+        payload = _fetch_page(skip=skip, limit=limit, extra_params=safe_filters)
         items = payload.get("items") or []
-
-        # Если нет элементов — это сигнал окончания данных
         if not items:
-            log.info("ABCP iterate all users: no items on page=%s (skip=%s). Done.", page, skip)
+            log.info("ABCP iterate %s: no items on page=%s (skip=%s). Done.", label, page, skip)
             break
 
-        # Логируем прогресс страницы и количество найденных записей
-        log.info("ABCP page=%s fetched: items=%s (skip=%s, limit=%s)",
-                 page, len(items), skip, limit)
+        log.info("ABCP %s page=%s fetched: items=%s (skip=%s, limit=%s)", label, page, len(items), skip, limit)
 
-        # Поочерёдно отдаём наружу каждого пользователя
-        for it in items:
-            # При желании можно логировать идентификаторы (если есть)
-            user_id = it.get("userId") or it.get("userID") or it.get("id")
-            reg_date = it.get("registrationDate")
-            log.debug("ABCP yield user: userId=%r, registrationDate=%r", user_id, reg_date)
-            yield it
+        for item in items:
+            user_id = item.get("userId") or item.get("userID") or item.get("id")
+            log.debug("ABCP yield %s: userId=%r", label, user_id)
+            yield item
 
-        # Увеличиваем смещение на размер фактически полученной порции
         processed = len(items)
         skip += processed
-        # Переходим к следующей странице
         page += 1
 
-    # Финальный лог о завершении итерации
-    log.info("ABCP iterate all users: finished at page=%s, last skip=%s", page, skip)
+        if processed < limit:
+            log.info("ABCP iterate %s: short page=%s (items=%s < limit=%s). Done.", label, page - 1, processed, limit)
+            break
+
+    log.info("ABCP iterate %s: finished at page=%s, last skip=%s", label, page, skip)
+
+
+def iter_all_users() -> Iterator[Dict[str, Any]]:
+    yield from _iter_users(label="all users", max_pages=_MAX_PAGES)
+
+
+def iter_users_filtered(
+    *,
+    date_registered_start: Optional[datetime] = None,
+    date_registered_end: Optional[datetime] = None,
+    date_updated_start: Optional[datetime] = None,
+    date_updated_end: Optional[datetime] = None,
+    label: str = "filtered users",
+) -> Iterator[Dict[str, Any]]:
+    extra_params: Dict[str, Any] = {}
+    if date_registered_start is not None:
+        extra_params["dateRegisteredStart"] = _format_abcp_datetime(date_registered_start)
+    if date_registered_end is not None:
+        extra_params["dateRegisteredEnd"] = _format_abcp_datetime(date_registered_end)
+    if date_updated_start is not None:
+        extra_params["dateUpdatedStart"] = _format_abcp_datetime(date_updated_start)
+    if date_updated_end is not None:
+        extra_params["dateUpdatedEnd"] = _format_abcp_datetime(date_updated_end)
+
+    yield from _iter_users(extra_params=extra_params, label=label, max_pages=None)
+
+
+def iter_users_registered_between(start: datetime, end: datetime) -> Iterator[Dict[str, Any]]:
+    yield from iter_users_filtered(
+        date_registered_start=start,
+        date_registered_end=end,
+        label="registered window",
+    )
+
+
+def iter_users_updated_between(start: datetime, end: datetime) -> Iterator[Dict[str, Any]]:
+    yield from iter_users_filtered(
+        date_updated_start=start,
+        date_updated_end=end,
+        label="updated window",
+    )
 
 
 def iter_today_users(today: Optional[date] = None) -> Iterator[Dict[str, Any]]:
-    """
-    Итерирует по пользователям, зарегистрированным «сегодня».
-
-    ВАЖНО: теперь НЕ вызываем iter_all_users (чтобы не обходить всё).
-    Идём постранично через _fetch_page и останавливаемся рано:
-    - как только встретим страницу, где все regDate < today (при сортировке по убыванию);
-    - или по достижении защитного лимита страниц.
-
-    Клиентская фильтрация по полю 'registrationDate', начинающемуся с 'YYYY-MM-DD'.
-    :param today: дата «сегодня» (для тестов можно подставить)
-    :yield: словарь пользователя, отфильтрованный по текущей дате
-    """
-    # Если дата не передана — берём системную
     today = today or date.today()
-    # Строка сравнения вида 'YYYY-MM-DD'
-    today_str = today.strftime("%Y-%m-%d")
-
-    # Логируем старт инкрементальной выборки
-    log.info("ABCP iterate today users: start for date=%s", today_str)
-
-    try:
-        total = _fetch_count()
-        if total <= 0:
-            log.info("ABCP today: total=0 — done.")
-            return
-
-        limit = _LIMIT
-        last_skip = ((total - 1) // limit) * limit 
-        pages_checked = 0
-        seen_today = False
-
-        skip = last_skip
-        while skip >= 0:
-            if pages_checked >= _TODAY_MAX_PAGES:
-                log.warning("ABCP today(backward): reached safeguard pages limit=%s, stop early", _TODAY_MAX_PAGES)
-                break
-
-            payload = _fetch_page(skip=skip, limit=limit)
-            items = payload.get("items") or []
-            if not items:
-                log.info("ABCP today(backward): empty page at skip=%s — stop.", skip)
-                break
-
-            todays = []
-            for it in items:
-                reg = (it.get("registrationDate") or "").strip()
-                if reg.startswith(today_str):
-                    todays.append(it)
-
-            log.info("ABCP today(backward) skip=%s: todays=%s", skip, len(todays))
-
-            if todays:
-                seen_today = True
-                for it in todays:
-                    user_id = it.get("userId") or it.get("userID") or it.get("id")
-                    log.debug("ABCP today match: userId=%r, registrationDate=%r", user_id, it.get("registrationDate"))
-                    yield it
-            else:
-                if seen_today:
-                    log.info("ABCP today(backward): first non-today page after todays — stop early.")
-                    break
-
-            pages_checked += 1
-            skip -= limit
-
-        log.info("ABCP iterate today users: finished for date=%s (backward scan)", today_str)
-        return
-
-    except Exception as e:
-        log.warning("ABCP today(backward) failed (%s) — fallback to forward scan.", e)
-
-    skip = 0
-    page = 0
-    limit = _LIMIT
-    pages_yielded = 0
-
-    while True:
-        if page >= _TODAY_MAX_PAGES:
-            log.warning("ABCP today: reached safeguard pages limit=%s, stop early", _TODAY_MAX_PAGES)
-            break
-
-        payload = _fetch_page(skip=skip, limit=limit)
-        items = payload.get("items") or []
-        if not items:
-            log.info("ABCP today: no items on page=%s (skip=%s). Done.", page, skip)
-            break
-
-        todays = []
-        older_than_today = True 
-
-        for it in items:
-            reg = (it.get("registrationDate") or "").strip()
-            day = reg[:10] if len(reg) >= 10 else ""
-            if day >= today_str:
-                older_than_today = False
-            if day == today_str:
-                todays.append(it)
-
-        if todays:
-            for it in todays:
-                user_id = it.get("userId") or it.get("userID") or it.get("id")
-                log.debug("ABCP today match: userId=%r, registrationDate=%r", user_id, it.get("registrationDate"))
-                yield it
-            pages_yielded += 1
-        else:
-            log.debug("ABCP today: no matches on page=%s", page)
-
-        if older_than_today:
-            log.info("ABCP today: page=%s is older than %s — stop early", page, today_str)
-            break
-
-        skip += len(items)
-        page += 1
-
-    log.info("ABCP iterate today users: finished for date=%s (pages with matches=%s)", today_str, pages_yielded)
+    start = datetime.combine(today, dt_time(0, 0, 0))
+    end = datetime.combine(today, dt_time(23, 59, 59))
+    yield from iter_users_filtered(
+        date_registered_start=start,
+        date_registered_end=end,
+        label=f"today users ({today.isoformat()})",
+    )

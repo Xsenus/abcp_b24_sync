@@ -1,13 +1,15 @@
 # db.py
 
 # Импортируем типы столбцов и функции для работы с SQLAlchemy Core/DDL.
-from sqlalchemy import create_engine, Integer, String, Text, DateTime, Boolean, func
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, case, create_engine, event, func
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
 # ORM-инструменты: базовый класс декларативных моделей, типизированные колонки и сессии.
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 # Конструктор запросов (используем для выборок).
 from sqlalchemy.sql import select
 # Стандартные типы.
-from typing import Optional
+from typing import Iterable, Optional
 # Python-тип datetime для корректной аннотации Mapped[datetime].
 from datetime import datetime as PyDT
 # Работа с путями в файловой системе (для гарантии каталога БД).
@@ -19,6 +21,7 @@ import logging
 
 # Инициируем модульный логгер.
 log = logging.getLogger(__name__)
+_ENGINE_CACHE: dict[str, Engine] = {}
 
 
 # Базовый класс всех ORM-моделей в проекте (SQLAlchemy 2.x способ).
@@ -74,13 +77,91 @@ class User(Base):
     updated_at: Mapped[PyDT] = mapped_column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+Index("ix_users_synced_id", User.synced, User.id)
+
+
+def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA cache_size=-64000")
+    finally:
+        cursor.close()
+
+
 def get_engine(sqlite_path: str):
     """
     Создаёт SQLAlchemy Engine для подключения к заданному файлу SQLite.
     echo=False — без verbose SQL, future=True — стиль 2.x.
     """
     log.debug("Создание Engine для SQLite по пути: %s", sqlite_path)
-    return create_engine(f"sqlite:///{sqlite_path}", echo=False, future=True)
+    cache_key = str(Path(sqlite_path).expanduser().resolve())
+    if cache_key in _ENGINE_CACHE:
+        return _ENGINE_CACHE[cache_key]
+
+    engine = create_engine(
+        f"sqlite:///{cache_key}",
+        echo=False,
+        future=True,
+        connect_args={"timeout": 30},
+    )
+    event.listen(engine, "connect", _configure_sqlite_connection)
+    _ENGINE_CACHE[cache_key] = engine
+    return engine
+
+
+def _user_values_from_item(item: dict) -> dict:
+    abcp_user_id = str(item.get("userId") or item.get("userID") or item.get("id"))
+    assert abcp_user_id, "userId missing"
+
+    return {
+        "abcp_user_id": abcp_user_id,
+        "name": item.get("name") or None,
+        "second_name": item.get("secondName") or None,
+        "surname": item.get("surname") or None,
+        "email": item.get("email") or None,
+        "mobile": item.get("mobile") or None,
+        "phone": item.get("phone") or None,
+        "city": item.get("city") or None,
+        "state": str(item.get("state") or ""),
+        "registration_date": item.get("registrationDate") or None,
+        "update_time": item.get("updateTime") or None,
+        "raw_json": json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def upsert_users_batch(session: Session, items: Iterable[dict]) -> int:
+    payloads = [_user_values_from_item(item) for item in items]
+    if not payloads:
+        return 0
+
+    stmt = sqlite_insert(User).values(payloads)
+    excluded = stmt.excluded
+    source_changed = User.raw_json != excluded.raw_json
+
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[User.abcp_user_id],
+        set_={
+            "name": func.coalesce(excluded.name, User.name),
+            "second_name": func.coalesce(excluded.second_name, User.second_name),
+            "surname": func.coalesce(excluded.surname, User.surname),
+            "email": func.coalesce(excluded.email, User.email),
+            "mobile": func.coalesce(excluded.mobile, User.mobile),
+            "phone": func.coalesce(excluded.phone, User.phone),
+            "city": func.coalesce(excluded.city, User.city),
+            "state": case((excluded.state != "", excluded.state), else_=User.state),
+            "registration_date": func.coalesce(excluded.registration_date, User.registration_date),
+            "update_time": func.coalesce(excluded.update_time, User.update_time),
+            "raw_json": excluded.raw_json,
+            "synced": case((source_changed, False), else_=User.synced),
+            "synced_at": case((source_changed, None), else_=User.synced_at),
+            "updated_at": func.now(),
+        },
+    )
+    session.execute(stmt)
+    return len(payloads)
 
 
 def init_db(sqlite_path: str):
