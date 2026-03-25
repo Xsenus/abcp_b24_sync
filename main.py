@@ -30,6 +30,7 @@ from sync_service import import_all, import_incremental, sync_to_b24
 # ---------- настройки ----------
 ENV_SYNC_INTERVAL = "SYNC_INTERVAL_SECONDS"
 DEFAULT_INTERVAL = 600  # сек
+MIN_INTERVAL = 300      # сек
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_DIR = "logs"
@@ -71,9 +72,18 @@ def _handle_sig(signum, frame):
 
 def _get_interval() -> int:
     try:
-        return int(os.getenv(ENV_SYNC_INTERVAL, str(DEFAULT_INTERVAL)))
+        interval = int(os.getenv(ENV_SYNC_INTERVAL, str(DEFAULT_INTERVAL)))
     except Exception:
         return DEFAULT_INTERVAL
+    if interval < MIN_INTERVAL:
+        logging.warning(
+            "%s=%s is too small for production load; clamping to %s seconds",
+            ENV_SYNC_INTERVAL,
+            interval,
+            MIN_INTERVAL,
+        )
+        return MIN_INTERVAL
+    return interval
 
 
 def _full_import_done(session: Session) -> bool:

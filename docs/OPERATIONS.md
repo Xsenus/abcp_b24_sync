@@ -135,6 +135,7 @@ Get-Content .\logs\sync_2026-03-25.log -Tail 100 -Wait
 - На вашем ABCP endpoint фильтр `dateRegisteredStart/dateRegisteredEnd` по live-проверке от 25 марта 2026 не дал корректной серверной фильтрации и возвращал почти весь массив пользователей.
 - Из-за этого в боевой логике используется только `updateTime`.
 - Новые регистрации не теряются, потому что у новых пользователей `updateTime` совпадает с `registrationDate`.
+- Если checkpoint отстал на дни или месяцы, сервис режет догоняющее окно на части по `ABCP_INCREMENTAL_MAX_WINDOW_MINUTES`, чтобы не упираться в ошибки ABCP на глубокой пагинации.
 
 ## Восстановление после потери локальной БД
 
@@ -179,6 +180,7 @@ python cli.py sync-b24
 SYNC_INTERVAL_SECONDS=600
 ABCP_INCREMENTAL_LOOKBACK_MINUTES=15
 ABCP_INCREMENTAL_OVERLAP_MINUTES=5
+ABCP_INCREMENTAL_MAX_WINDOW_MINUTES=1440
 ```
 
 ### Несинхронизированные записи висят в очереди

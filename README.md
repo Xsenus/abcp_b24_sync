@@ -13,7 +13,8 @@
 1. Один раз выполняется полный импорт всех пользователей ABCP.
 2. Дальше сервис работает инкрементально по `updateTime`.
 3. На каждом тике берётся окно изменений с overlap, чтобы не потерять записи на границе запусков.
-4. В Bitrix24 синхронизируются только записи, у которых реально изменился исходный JSON.
+4. Если checkpoint сильно отстал, backlog обрабатывается кусками, а не одним запросом на месяцы истории.
+5. В Bitrix24 синхронизируются только записи, у которых реально изменился исходный JSON.
 
 Важно:
 
@@ -88,7 +89,7 @@ python main.py
 SYNC_INTERVAL_SECONDS=600
 ```
 
-Это 10 минут. Если нужно, можно изменить в `.env`.
+Это 10 минут. Если в `.env` указать слишком маленькое значение, `main.py` всё равно поднимет его минимум до `300` секунд, чтобы не перегружать ABCP.
 
 Для Linux есть обёртка:
 
@@ -199,6 +200,7 @@ ABCP_USERPSW
 ABCP_LIMIT
 ABCP_INCREMENTAL_LOOKBACK_MINUTES
 ABCP_INCREMENTAL_OVERLAP_MINUTES
+ABCP_INCREMENTAL_MAX_WINDOW_MINUTES
 
 B24_WEBHOOK_URL
 B24_DEAL_CATEGORY_ID_USERS
@@ -219,6 +221,7 @@ SYNC_INTERVAL_SECONDS
 ```text
 ABCP_INCREMENTAL_LOOKBACK_MINUTES=15
 ABCP_INCREMENTAL_OVERLAP_MINUTES=5
+ABCP_INCREMENTAL_MAX_WINDOW_MINUTES=1440
 SYNC_INTERVAL_SECONDS=600
 RATE_LIMIT_SLEEP=3
 ```

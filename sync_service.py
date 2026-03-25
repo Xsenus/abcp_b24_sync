@@ -29,6 +29,7 @@ from config import (
     UF_B24_DEAL_REG_DATE, UF_B24_DEAL_UPDATE_TIME,
     ABCP_TIMEZONE, B24_OUT_TZ_ISO,
     ABCP_INCREMENTAL_LOOKBACK_MINUTES, ABCP_INCREMENTAL_OVERLAP_MINUTES,
+    ABCP_INCREMENTAL_MAX_WINDOW_MINUTES,
 )
 
 # Модульный логгер
@@ -183,23 +184,43 @@ def _resolve_incremental_window(now: Optional[datetime] = None) -> tuple[datetim
 
     lookback_minutes = max(int(ABCP_INCREMENTAL_LOOKBACK_MINUTES or 15), 1)
     overlap_minutes = max(int(ABCP_INCREMENTAL_OVERLAP_MINUTES or 5), 0)
+    max_window_minutes = max(int(ABCP_INCREMENTAL_MAX_WINDOW_MINUTES or 1440), 1)
 
     if checkpoint is None:
         base_start = window_end - timedelta(minutes=lookback_minutes)
     else:
         base_start = checkpoint.astimezone(abcp_tz)
+        if base_start > window_end:
+            logger.warning(
+                "Incremental import: checkpoint is in the future, clamping to now (checkpoint=%s, now=%s)",
+                base_start.isoformat(),
+                window_end.isoformat(),
+            )
+            base_start = window_end
+
+        max_window_end = _truncate_seconds(base_start + timedelta(minutes=max_window_minutes))
+        if max_window_end < window_end:
+            logger.warning(
+                "Incremental import: backlog window chunked (checkpoint=%s, requested_end=%s, chunk_end=%s, max_window_min=%s)",
+                base_start.isoformat(),
+                window_end.isoformat(),
+                max_window_end.isoformat(),
+                max_window_minutes,
+            )
+            window_end = max_window_end
 
     window_start = _truncate_seconds(base_start - timedelta(minutes=overlap_minutes))
     if window_start > window_end:
         window_start = window_end
 
     logger.info(
-        "Incremental import window resolved: start=%s, end=%s, checkpoint=%s, lookback_min=%s, overlap_min=%s",
+        "Incremental import window resolved: start=%s, end=%s, checkpoint=%s, lookback_min=%s, overlap_min=%s, max_window_min=%s",
         window_start.isoformat(),
         window_end.isoformat(),
         checkpoint.isoformat() if checkpoint is not None else None,
         lookback_minutes,
         overlap_minutes,
+        max_window_minutes,
     )
     return window_start, window_end
 
