@@ -427,24 +427,41 @@ def _safe_add_or_update_contact(name: str,
             return None
 
 
+def _is_b24_not_found_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in (
+        "not found",
+        "is not found",
+        "не найден",
+        "не найдена",
+        "не найдено",
+    ))
+
+
 def _safe_update_contact(contact_id: int,
                          name: str,
                          phone: Optional[str],
                          email: Optional[str],
                          comment: str,
                          *,
-                         inn: Optional[str] = None) -> bool:
+                         inn: Optional[str] = None) -> tuple[bool, bool]:
     try:
         update_contact_abcp(contact_id, name, phone, email, comment, inn=inn)
-        return True
+        return True, False
     except Exception as e1:
-        logger.warning("Контакт: ошибка при update (с email): %s — пробую без EMAIL", e1)
+        if _is_b24_not_found_error(e1):
+            logger.warning("Contact: stale B24 contact_id=%s, will rebind; err=%s", contact_id, e1)
+            return False, True
+        logger.warning("Contact: update with EMAIL failed for contact_id=%s, retry without EMAIL: %s", contact_id, e1)
         try:
             update_contact_abcp(contact_id, name, phone, None, comment, inn=inn)
-            return True
+            return True, False
         except Exception as e2:
-            logger.error("Контакт: не удалось обновить даже без EMAIL: %s", e2)
-            return False
+            if _is_b24_not_found_error(e2):
+                logger.warning("Contact: stale B24 contact_id=%s still missing after retry without EMAIL: %s", contact_id, e2)
+                return False, True
+            logger.error("Contact: update failed even without EMAIL for contact_id=%s: %s", contact_id, e2)
+            return False, False
 
 
 def sync_to_b24(limit: Optional[int] = None) -> int:
@@ -521,10 +538,23 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             comment = f"ABCP userId: {abcp_user_id}; Город: {u.city or ''}; Регистрация: {u.registration_date or ''}"
             if u.b24_contact_id:
                 contact_id = int(u.b24_contact_id)
-                logger.debug("B24: reuse contact_id=%s из БД", contact_id)
-                if not _safe_update_contact(contact_id, contact_name, phone, email, comment, inn=inn):
+                logger.debug("B24: reuse contact_id=%s from DB", contact_id)
+                contact_updated, stale_contact_id = _safe_update_contact(contact_id, contact_name, phone, email, comment, inn=inn)
+                if stale_contact_id:
+                    logger.warning("Sync #%d: stale B24 contact_id=%s for abcp_user_id=%s, rebinding", idx, contact_id, abcp_user_id)
+                    u.b24_contact_id = None
+                    session.commit()
+                    contact_id = _safe_add_or_update_contact(contact_name, phone, email, comment, inn=inn)
+                    if not contact_id:
+                        session.rollback()
+                        logger.warning("Sync #%d skipped: contact was not rebound for abcp_user_id=%s", idx, abcp_user_id)
+                        continue
+                    u.b24_contact_id = str(contact_id)
+                    session.commit()
+                    logger.info("B24: contact rebound after stale ID (NAME=%r), contact_id=%s", contact_name, contact_id)
+                elif not contact_updated:
                     session.rollback()
-                    logger.warning("Синхронизация: #%d пропущена (контакт не обновлён) — abcp_user_id=%s", idx, abcp_user_id)
+                    logger.warning("Sync #%d skipped: contact update failed for abcp_user_id=%s", idx, abcp_user_id)
                     continue
             else:
                 logger.debug(
@@ -580,8 +610,27 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
             try:
                 if u.b24_deal_id:
                     deal_id = int(u.b24_deal_id)
-                    update_deal_with_fields(deal_id, fields)
-                    logger.info("B24: сделка обновлена (TITLE=%r), deal_id=%s", title, deal_id)
+                    try:
+                        update_deal_with_fields(deal_id, fields)
+                        logger.info("B24: deal updated (TITLE=%r), deal_id=%s", title, deal_id)
+                    except Exception as e:
+                        if not _is_b24_not_found_error(e):
+                            raise
+                        logger.warning("Sync #%d: stale B24 deal_id=%s for abcp_user_id=%s, rebinding", idx, deal_id, abcp_user_id)
+                        u.b24_deal_id = None
+                        session.commit()
+                        existing_deal_id = find_deal_by_field(
+                            UF_B24_DEAL_ABCP_USER_ID,
+                            abcp_user_id,
+                            category_id=B24_DEAL_CATEGORY_ID_USERS,
+                        )
+                        deal_id = existing_deal_id or add_deal_with_fields(fields)
+                        if existing_deal_id is not None:
+                            update_deal_with_fields(deal_id, fields)
+                            logger.info("B24: existing deal rebound after stale ID (TITLE=%r), deal_id=%s", title, deal_id)
+                        else:
+                            logger.info("B24: deal recreated after stale ID (TITLE=%r), deal_id=%s", title, deal_id)
+                        u.b24_deal_id = str(deal_id)
                 else:
                     existing_deal_id = find_deal_by_field(
                         UF_B24_DEAL_ABCP_USER_ID,
@@ -591,9 +640,9 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
                     deal_id = existing_deal_id or add_deal_with_fields(fields)
                     if existing_deal_id is not None:
                         update_deal_with_fields(deal_id, fields)
-                        logger.info("B24: найдена существующая сделка и обновлена (TITLE=%r), deal_id=%s", title, deal_id)
+                        logger.info("B24: found existing deal and updated it (TITLE=%r), deal_id=%s", title, deal_id)
                     else:
-                        logger.info("B24: сделка создана (воронка «Пользователи», TITLE=%r), deal_id=%s", title, deal_id)
+                        logger.info("B24: deal created in Users funnel (TITLE=%r), deal_id=%s", title, deal_id)
                     u.b24_deal_id = str(deal_id)
 
                 u.synced = True

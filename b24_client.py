@@ -21,6 +21,22 @@ _HTTP.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=10, max_ret
 _HTTP.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0))
 _CONTACT_LOOKUP_CACHE: Dict[tuple[str, str], int] = {}
 
+
+class B24CallError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _is_retryable_b24_response(status_code: int, error_code: Optional[str] = None) -> bool:
+    if status_code >= 500 or status_code == 429:
+        return True
+    if error_code:
+        normalized = str(error_code).upper()
+        if normalized in {"QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"}:
+            return True
+    return False
+
 # -------------------------
 # Утилиты нормализации
 # -------------------------
@@ -123,16 +139,31 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(data, dict):
                 err = data.get("error")
                 desc = data.get("error_description")
-                raise RuntimeError(f"B24 {method} HTTP {r.status_code}: {err or 'ERROR'} - {desc or data}")
+                raise B24CallError(
+                    f"B24 {method} HTTP {r.status_code}: {err or 'ERROR'} - {desc or data}",
+                    retryable=_is_retryable_b24_response(r.status_code, err),
+                )
             # Если не JSON — поднимаем HTTPError с текстом ответа
-            r.raise_for_status()
+            body = (r.text or "").strip()
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = body[:500] if body else "HTTP error without JSON body"
+                raise B24CallError(
+                    f"B24 {method} HTTP {r.status_code}: {detail}",
+                    retryable=_is_retryable_b24_response(r.status_code),
+                ) from exc
 
         if not isinstance(data, dict):
-            raise RuntimeError(f"Unexpected B24 response type: {type(data)}")
+            raise B24CallError(f"Unexpected B24 response type: {type(data)}", retryable=False)
 
         if "error" in data:
             # Bitrix может вернуть 200 с полем error
-            raise RuntimeError(f"B24 error: {data.get('error')} - {data.get('error_description')}")
+            err = data.get("error")
+            raise B24CallError(
+                f"B24 error: {err} - {data.get('error_description')}",
+                retryable=_is_retryable_b24_response(r.status_code, err),
+            )
 
         return data
 
@@ -150,6 +181,8 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             return data
         except Exception as e:
             last = e
+            if isinstance(e, B24CallError) and not e.retryable:
+                break
             if attempt >= retries:
                 break
             time.sleep(backoff * (attempt + 1))
