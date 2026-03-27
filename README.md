@@ -10,7 +10,9 @@
 
 Текущая рабочая схема после live-проверки:
 
-1. Один раз выполняется полный импорт всех пользователей ABCP.
+1. На первом запуске сервис может работать в одном из двух режимов:
+   - `ABCP_INITIAL_IMPORT_MODE=full` — один раз делает полный импорт всех пользователей ABCP;
+   - `ABCP_INITIAL_IMPORT_MODE=incremental` — не забирает весь список, а сразу стартует с окна изменений по `updateTime`.
 2. Дальше сервис работает инкрементально по `updateTime`.
 3. На каждом тике берётся окно изменений с overlap, чтобы не потерять записи на границе запусков.
 4. Если checkpoint сильно отстал, backlog обрабатывается кусками, а не одним запросом на месяцы истории.
@@ -78,7 +80,8 @@ python main.py
 
 - проверяет конфиг;
 - поднимает SQLite;
-- если полного импорта ещё не было, делает его один раз;
+- если это первый запуск и `ABCP_INITIAL_IMPORT_MODE=full`, делает один `import-all`;
+- если это первый запуск и `ABCP_INITIAL_IMPORT_MODE=incremental`, автоматически ставит checkpoint назад на `ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES` и сразу начинает `import-incremental`;
 - затем запускает бесконечный цикл:
   - `import-incremental`
   - `sync-b24`
@@ -109,8 +112,6 @@ python -m venv .venv
 pip install -r requirements.txt
 Copy-Item .env.example .env
 python cli.py init-db
-python cli.py import-all
-python cli.py sync-b24
 python main.py
 ```
 
@@ -122,9 +123,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 python cli.py init-db
+python main.py
+```
+
+Если нужен legacy-сценарий с полным списком, выставьте `ABCP_INITIAL_IMPORT_MODE=full` и выполните:
+
+```bash
 python cli.py import-all
 python cli.py sync-b24
-python main.py
 ```
 
 ## Логи
@@ -198,6 +204,8 @@ ABCP_BASE_URL
 ABCP_USERLOGIN
 ABCP_USERPSW
 ABCP_LIMIT
+ABCP_INITIAL_IMPORT_MODE
+ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES
 ABCP_INCREMENTAL_LOOKBACK_MINUTES
 ABCP_INCREMENTAL_OVERLAP_MINUTES
 ABCP_INCREMENTAL_MAX_WINDOW_MINUTES
@@ -219,6 +227,8 @@ SYNC_INTERVAL_SECONDS
 Рекомендуемые значения для регулярной работы:
 
 ```text
+ABCP_INITIAL_IMPORT_MODE=incremental
+ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES=1440
 ABCP_INCREMENTAL_LOOKBACK_MINUTES=15
 ABCP_INCREMENTAL_OVERLAP_MINUTES=5
 ABCP_INCREMENTAL_MAX_WINDOW_MINUTES=1440

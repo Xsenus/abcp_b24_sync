@@ -16,16 +16,22 @@ import time
 import signal
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import find_dotenv
 
-from config import assert_config, SQLITE_PATH
+from config import (
+    ABCP_INCREMENTAL_LOOKBACK_MINUTES,
+    ABCP_INITIAL_IMPORT_MODE,
+    ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES,
+    SQLITE_PATH,
+    assert_config,
+)
 from db import init_db, get_engine, get_meta, set_meta
 from sqlalchemy.orm import Session
 
-from sync_service import import_all, import_incremental, sync_to_b24
+from sync_service import INCREMENTAL_WINDOW_END_META_KEY, import_all, import_incremental, sync_to_b24
 
 # ---------- настройки ----------
 ENV_SYNC_INTERVAL = "SYNC_INTERVAL_SECONDS"
@@ -86,16 +92,37 @@ def _get_interval() -> int:
     return interval
 
 
-def _full_import_done(session: Session) -> bool:
-    ts = get_meta(session, "last_full_import_at")
-    return bool(ts)
+def _initial_sync_seeded(session: Session) -> bool:
+    return bool(
+        get_meta(session, "last_full_import_at")
+        or get_meta(session, INCREMENTAL_WINDOW_END_META_KEY)
+    )
 
 
 def _mark_full_import(session: Session, *, started_at: datetime) -> None:
     set_meta(session, "last_full_import_started_at", started_at.isoformat())
     set_meta(session, "last_full_import_at", datetime.now(timezone.utc).isoformat())
-    set_meta(session, "last_incremental_window_end", started_at.isoformat())
+    set_meta(session, INCREMENTAL_WINDOW_END_META_KEY, started_at.isoformat())
     session.commit()
+
+
+def _effective_initial_incremental_lookback_minutes() -> int:
+    lookback = ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES
+    if lookback is None:
+        lookback = ABCP_INCREMENTAL_LOOKBACK_MINUTES
+    return max(int(lookback or 15), 1)
+
+
+def _bootstrap_incremental_start(session: Session, *, now: datetime) -> None:
+    lookback_minutes = _effective_initial_incremental_lookback_minutes()
+    checkpoint = now - timedelta(minutes=lookback_minutes)
+    set_meta(session, INCREMENTAL_WINDOW_END_META_KEY, checkpoint.isoformat())
+    session.commit()
+    logging.info(
+        "Initial full import skipped: incremental bootstrap checkpoint=%s, lookback_min=%s",
+        checkpoint.isoformat(),
+        lookback_minutes,
+    )
 
 
 def run_daemon() -> None:
@@ -120,18 +147,23 @@ def run_daemon() -> None:
     except Exception:
         pass
 
-    # Один раз — полный импорт, если ещё не делали
+    logging.info("Initial import mode=%s", ABCP_INITIAL_IMPORT_MODE)
+
+    # Инициализация первого запуска: либо legacy full import, либо сразу incremental bootstrap.
     with Session(get_engine(SQLITE_PATH)) as session:
-        if not _full_import_done(session):
-            logging.info("Initial full import: start")
-            full_import_started_at = datetime.now(timezone.utc)
-            try:
-                cnt = import_all()
-                logging.info("Initial full import: done, users=%d", cnt)
-                _mark_full_import(session, started_at=full_import_started_at)
-            except Exception:
-                logging.exception("Initial full import FAILED")
-                # продолжаем — в цикле пойдёт инкрементальная загрузка
+        if not _initial_sync_seeded(session):
+            if ABCP_INITIAL_IMPORT_MODE == "incremental":
+                _bootstrap_incremental_start(session, now=datetime.now(timezone.utc))
+            else:
+                logging.info("Initial full import: start")
+                full_import_started_at = datetime.now(timezone.utc)
+                try:
+                    cnt = import_all()
+                    logging.info("Initial full import: done, users=%d", cnt)
+                    _mark_full_import(session, started_at=full_import_started_at)
+                except Exception:
+                    logging.exception("Initial full import FAILED")
+                    # продолжаем — в цикле пойдёт инкрементальная загрузка
 
     interval = _get_interval()
     logging.info("Loop: every %ss", interval)

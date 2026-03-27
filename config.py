@@ -42,6 +42,8 @@ ABCP_USERPSW   = os.getenv("ABCP_USERPSW", "").strip()
 ABCP_LIMIT     = getenv_int("ABCP_LIMIT", 500)
 # Максимум страниц (int или None — без лимита)
 ABCP_MAX_PAGES = getenv_int("ABCP_MAX_PAGES", None)
+ABCP_INITIAL_IMPORT_MODE = os.getenv("ABCP_INITIAL_IMPORT_MODE", "full").strip().lower()
+ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES = getenv_int("ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES", None)
 ABCP_INCREMENTAL_LOOKBACK_MINUTES = getenv_int("ABCP_INCREMENTAL_LOOKBACK_MINUTES", 15)
 ABCP_INCREMENTAL_OVERLAP_MINUTES = getenv_int("ABCP_INCREMENTAL_OVERLAP_MINUTES", 5)
 ABCP_INCREMENTAL_MAX_WINDOW_MINUTES = getenv_int("ABCP_INCREMENTAL_MAX_WINDOW_MINUTES", 1440)
@@ -118,6 +120,9 @@ def assert_config() -> None:
     assert ABCP_BASE_URL,  "ABCP_BASE_URL required"
     assert ABCP_USERLOGIN, "ABCP_USERLOGIN required"
     assert ABCP_USERPSW,   "ABCP_USERPSW required"
+    assert ABCP_INITIAL_IMPORT_MODE in {"full", "incremental"}, (
+        "ABCP_INITIAL_IMPORT_MODE must be 'full' or 'incremental'"
+    )
 
     # Требуемые параметры для Bitrix24
     assert B24_WEBHOOK_URL, "B24_WEBHOOK_URL required"
@@ -177,6 +182,12 @@ def log_config(level: int = logging.DEBUG) -> None:
         ABCP_MAX_PAGES,
         ABCP_INCREMENTAL_LOOKBACK_MINUTES,
         ABCP_INCREMENTAL_OVERLAP_MINUTES,
+    )
+    logger.log(
+        level,
+        "ABCP_INITIAL_IMPORT_MODE=%r, ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES=%s",
+        ABCP_INITIAL_IMPORT_MODE,
+        ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES,
     )
     logger.log(level, "ABCP_INCREMENTAL_MAX_WINDOW_MINUTES=%s", ABCP_INCREMENTAL_MAX_WINDOW_MINUTES)
 

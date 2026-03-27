@@ -18,13 +18,22 @@ pip install -r requirements.txt
 
 3. Проверить `.env`.
 
-4. Если это самый первый запуск:
+4. Если это самый первый запуск и нужен полный список:
 
 ```bash
 python cli.py init-db
 python cli.py import-all
 python cli.py sync-b24
 ```
+
+Если полный список забирать не нужно, рекомендуемый режим такой:
+
+```bash
+python cli.py init-db
+python main.py
+```
+
+При `ABCP_INITIAL_IMPORT_MODE=incremental` сервис сам стартует с окна изменений по `updateTime` и дальше работает без `import-all`.
 
 5. Для постоянной работы:
 
@@ -49,6 +58,7 @@ tail -f logs/service.log
 Ищем строки:
 
 - `Initial full import: done`
+- `Initial full import skipped: incremental bootstrap checkpoint=...`
 - `Tick: import_incremental done`
 - `Tick: sync_to_b24 done`
 
@@ -135,6 +145,8 @@ Get-Content .\logs\sync_2026-03-25.log -Tail 100 -Wait
 - На вашем ABCP endpoint фильтр `dateRegisteredStart/dateRegisteredEnd` по live-проверке от 25 марта 2026 не дал корректной серверной фильтрации и возвращал почти весь массив пользователей.
 - Из-за этого в боевой логике используется только `updateTime`.
 - Новые регистрации не теряются, потому что у новых пользователей `updateTime` совпадает с `registrationDate`.
+- Полный импорт на первом старте можно отключить через `ABCP_INITIAL_IMPORT_MODE=incremental`.
+- В incremental-режиме первый запуск автоматически выставляет checkpoint назад на `ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES` и затем забирает свежие изменения.
 - Если checkpoint отстал на дни или месяцы, сервис режет догоняющее окно на части по `ABCP_INCREMENTAL_MAX_WINDOW_MINUTES`, чтобы не упираться в ошибки ABCP на глубокой пагинации.
 
 ## Восстановление после потери локальной БД
@@ -147,10 +159,16 @@ Get-Content .\logs\sync_2026-03-25.log -Tail 100 -Wait
 python cli.py init-db
 ```
 
-2. Сделать полный импорт:
+2. Если нужен полный список, сделать полный импорт:
 
 ```bash
 python cli.py import-all
+```
+
+Если полный список не нужен, можно вместо этого сразу перейти на incremental-режим:
+
+```bash
+python main.py
 ```
 
 3. Сделать синк в Bitrix24:
@@ -177,6 +195,8 @@ python cli.py sync-b24
 Нормальная схема сейчас:
 
 ```text
+ABCP_INITIAL_IMPORT_MODE=incremental
+ABCP_INITIAL_INCREMENTAL_LOOKBACK_MINUTES=1440
 SYNC_INTERVAL_SECONDS=600
 ABCP_INCREMENTAL_LOOKBACK_MINUTES=15
 ABCP_INCREMENTAL_OVERLAP_MINUTES=5

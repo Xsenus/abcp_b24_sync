@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
-from config import SQLITE_PATH, assert_config
+from config import ABCP_INITIAL_IMPORT_MODE, SQLITE_PATH, assert_config
 from db import init_db
 from sync_service import import_all, import_incremental, import_today, sync_to_b24
 
@@ -49,7 +49,7 @@ def main() -> None:
     p_sync = sub.add_parser("sync-b24", help="Sync unsynced rows to Bitrix24")
     p_sync.add_argument("--limit", type=int, default=None, help="Limit rows per run")
 
-    sub.add_parser("run", help="Full import then sync to Bitrix24")
+    sub.add_parser("run", help="Bootstrap import then sync to Bitrix24")
 
     args = parser.parse_args()
 
@@ -82,7 +82,14 @@ def main() -> None:
             count = sync_to_b24(limit=args.limit)
             print("Synced to Bitrix24:", count)
         elif args.cmd == "run":
-            imported = import_all()
+            if ABCP_INITIAL_IMPORT_MODE == "incremental":
+                logging.info(
+                    "run: ABCP_INITIAL_IMPORT_MODE=%r, using import-incremental instead of import-all",
+                    ABCP_INITIAL_IMPORT_MODE,
+                )
+                imported = import_incremental()
+            else:
+                imported = import_all()
             synced = sync_to_b24()
             print("Imported:", imported)
             print("Synced:", synced)
