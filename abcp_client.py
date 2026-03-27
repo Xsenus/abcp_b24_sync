@@ -19,6 +19,7 @@ from config import (
     REQUESTS_RETRY_BACKOFF,
     REQUESTS_TIMEOUT,
 )
+from request_analytics import record_http_transaction
 from utils import with_retries
 
 log = logging.getLogger(__name__)
@@ -83,20 +84,62 @@ def _safe_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in params.items() if k != "userpsw"}
 
 
+def _extract_response_payload(response: Optional[requests.Response]) -> Any:
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        body = (response.text or "").strip()
+        return body or None
+
+
 def _fetch_page(skip: int, limit: int, extra_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     params = _build_params(skip=skip, limit=limit, extra_params=extra_params)
     safe_params = _safe_params(params)
     log.debug("ABCP GET %s params=%s", ABCP_BASE_URL, safe_params)
+    attempt = 0
 
     def do() -> Dict[str, Any]:
+        nonlocal attempt
+        attempt += 1
         _wait_rate_limit()
+        started = time.perf_counter()
+        response: Optional[requests.Response] = None
         try:
             response = _HTTP.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
                 raise RuntimeError(f"Unexpected ABCP response type: {type(data)}")
+            record_http_transaction(
+                provider="ABCP",
+                operation="users.list",
+                http_method="GET",
+                url=ABCP_BASE_URL,
+                request_payload=safe_params,
+                response_payload=data,
+                status_code=response.status_code,
+                success=True,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                attempt=attempt,
+            )
             return data
+        except Exception as exc:
+            record_http_transaction(
+                provider="ABCP",
+                operation="users.list",
+                http_method="GET",
+                url=ABCP_BASE_URL,
+                request_payload=safe_params,
+                response_payload=_extract_response_payload(response),
+                status_code=response.status_code if response is not None else None,
+                success=False,
+                error=exc,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                attempt=attempt,
+            )
+            raise
         finally:
             _mark_request_complete()
 
@@ -114,17 +157,50 @@ def _fetch_page(skip: int, limit: int, extra_params: Optional[Dict[str, Any]] = 
 
 def _fetch_count(extra_params: Optional[Dict[str, Any]] = None) -> int:
     params = _build_params(skip=0, limit=0, extra_params=extra_params)
-    log.debug("ABCP COUNT %s params=%s", ABCP_BASE_URL, _safe_params(params))
+    safe_params = _safe_params(params)
+    log.debug("ABCP COUNT %s params=%s", ABCP_BASE_URL, safe_params)
+    attempt = 0
 
     def do() -> int:
+        nonlocal attempt
+        attempt += 1
         _wait_rate_limit()
+        started = time.perf_counter()
+        response: Optional[requests.Response] = None
         try:
             response = _HTTP.get(ABCP_BASE_URL, params=params, timeout=_REQ_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict) or "count" not in data:
                 raise RuntimeError("ABCP count response has no 'count'")
+            record_http_transaction(
+                provider="ABCP",
+                operation="users.count",
+                http_method="GET",
+                url=ABCP_BASE_URL,
+                request_payload=safe_params,
+                response_payload=data,
+                status_code=response.status_code,
+                success=True,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                attempt=attempt,
+            )
             return int(str(data["count"]))
+        except Exception as exc:
+            record_http_transaction(
+                provider="ABCP",
+                operation="users.count",
+                http_method="GET",
+                url=ABCP_BASE_URL,
+                request_payload=safe_params,
+                response_payload=_extract_response_payload(response),
+                status_code=response.status_code if response is not None else None,
+                success=False,
+                error=exc,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                attempt=attempt,
+            )
+            raise
         finally:
             _mark_request_complete()
 

@@ -5,7 +5,7 @@ from dotenv import load_dotenv, find_dotenv, dotenv_values
 # Доступ к системным переменным окружения
 import os
 # Хелперы приведения типов с дефолтами (из нашего utils.py)
-from utils import getenv_int, getenv_float
+from utils import getenv_bool, getenv_float, getenv_int
 # Логирование состояния конфигурации
 import logging
 # Разбор URL, чтобы безопасно логировать домен вебхука Bitrix24
@@ -90,6 +90,9 @@ REQUESTS_RETRY_BACKOFF = getenv_float("REQUESTS_RETRY_BACKOFF", 1.5)
 # Пауза между успешными вызовами (сек) — бережём rate-limits
 # По требованию ABCP выдерживаем минимум 3 секунды между вызовами.
 RATE_LIMIT_SLEEP       = getenv_float("RATE_LIMIT_SLEEP", 3.0)
+REQUEST_ANALYTICS_ENABLED = getenv_bool("REQUEST_ANALYTICS_ENABLED", True)
+REQUEST_ANALYTICS_DIR = os.getenv("REQUEST_ANALYTICS_DIR", "logs/http_requests").strip() or "logs/http_requests"
+REQUEST_ANALYTICS_MAX_BODY_CHARS = getenv_int("REQUEST_ANALYTICS_MAX_BODY_CHARS", 20000)
 
 # ---------------------- Проверка конфигурации ----------------------
 
@@ -209,3 +212,10 @@ def log_config(level: int = logging.DEBUG) -> None:
     logger.log(level, "SQLITE_PATH=%s", SQLITE_PATH)
     logger.log(level, "HTTP: timeout=%s, retries=%s, backoff=%s, sleep=%s",
                REQUESTS_TIMEOUT, REQUESTS_RETRIES, REQUESTS_RETRY_BACKOFF, RATE_LIMIT_SLEEP)
+    logger.log(
+        level,
+        "REQUEST_ANALYTICS: enabled=%s, dir=%s, max_body_chars=%s",
+        REQUEST_ANALYTICS_ENABLED,
+        REQUEST_ANALYTICS_DIR,
+        REQUEST_ANALYTICS_MAX_BODY_CHARS,
+    )

@@ -193,6 +193,30 @@ tail -f logs/sync_$(date +%F).log
 python cli.py --log-level INFO --log-file logs/manual_sync.log sync-b24
 ```
 
+### HTTP-аналитика запросов
+
+Отдельный журнал исходящих запросов включён по умолчанию. Для каждого HTTP-вызова в `ABCP` и `Bitrix24` пишется одна JSON-строка с:
+
+- временем запроса;
+- методом и URL;
+- телом запроса или query-параметрами;
+- телом ответа с ограничением по размеру;
+- признаком `success=true/false`;
+- исходом `positive/negative`;
+- HTTP-статусом и номером попытки.
+
+Файлы создаются по дням:
+
+```text
+logs/http_requests/request_analytics_YYYY-MM-DD.log
+```
+
+Пример просмотра в PowerShell:
+
+```powershell
+Get-Content .\logs\http_requests\request_analytics_2026-03-27.log -Tail 100 -Wait
+```
+
 ## Конфигурация
 
 Все рабочие переменные перечислены в `.env.example`.
@@ -222,6 +246,9 @@ UF_B24_DEAL_UPDATE_TIME
 
 SQLITE_PATH
 SYNC_INTERVAL_SECONDS
+REQUEST_ANALYTICS_ENABLED
+REQUEST_ANALYTICS_DIR
+REQUEST_ANALYTICS_MAX_BODY_CHARS
 ```
 
 Рекомендуемые значения для регулярной работы:
@@ -234,6 +261,8 @@ ABCP_INCREMENTAL_OVERLAP_MINUTES=5
 ABCP_INCREMENTAL_MAX_WINDOW_MINUTES=1440
 SYNC_INTERVAL_SECONDS=600
 RATE_LIMIT_SLEEP=3
+REQUEST_ANALYTICS_ENABLED=1
+REQUEST_ANALYTICS_DIR=logs/http_requests
 ```
 
 ## Поведение Bitrix24

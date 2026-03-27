@@ -13,6 +13,7 @@ from config import (
     REQUESTS_RETRY_BACKOFF,
     RATE_LIMIT_SLEEP,
 )
+from request_analytics import record_http_transaction
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +119,18 @@ def _to_int(x: Any) -> int:
         raise ValueError(f"Cannot convert to int: {x!r}") from e
 
 
+def _extract_response_payload(response: Optional[requests.Response], data: Any = None) -> Any:
+    if data is not None:
+        return data
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        body = (response.text or "").strip()
+        return body or None
+
+
 def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Вызов REST Bitrix24 с повторами и подробной диагностикой:
@@ -125,14 +138,22 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     - логируем 4xx с телом ответа
     """
     url = B24_WEBHOOK_URL.rstrip("/") + "/" + method
+    last_status_code: Optional[int] = None
+    last_response_payload: Any = None
+    last_duration_ms: Optional[float] = None
 
-    def do() -> Dict[str, Any]:
+    def do(attempt_no: int) -> Dict[str, Any]:
+        nonlocal last_duration_ms, last_status_code, last_response_payload
+        started = time.perf_counter()
         r = _HTTP.post(url, json=params, timeout=REQUESTS_TIMEOUT)
         # Пытаемся всегда разобрать JSON — даже на 4xx, чтобы достать описание
         try:
             data: Any = r.json()
         except ValueError:
             data = None
+        last_status_code = r.status_code
+        last_response_payload = _extract_response_payload(r, data)
+        last_duration_ms = (time.perf_counter() - started) * 1000.0
 
         if r.status_code >= 400:
             # Максимально информативная ошибка
@@ -164,7 +185,18 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
                 f"B24 error: {err} - {data.get('error_description')}",
                 retryable=_is_retryable_b24_response(r.status_code, err),
             )
-
+        record_http_transaction(
+            provider="Bitrix24",
+            operation=method,
+            http_method="POST",
+            url=url,
+            request_payload=params,
+            response_payload=data,
+            status_code=r.status_code,
+            success=True,
+            duration_ms=last_duration_ms,
+            attempt=attempt_no,
+        )
         return data
 
     # Повторы
@@ -176,11 +208,24 @@ def _call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             if attempt:
                 log.warning("B24 RETRY %s (%d/%d)", method, attempt, retries)
-            data = do()
+            data = do(attempt + 1)
             time.sleep(float(RATE_LIMIT_SLEEP or 0))
             return data
         except Exception as e:
             last = e
+            record_http_transaction(
+                provider="Bitrix24",
+                operation=method,
+                http_method="POST",
+                url=url,
+                request_payload=params,
+                response_payload=last_response_payload,
+                status_code=last_status_code,
+                success=False,
+                error=e,
+                duration_ms=last_duration_ms,
+                attempt=attempt + 1,
+            )
             if isinstance(e, B24CallError) and not e.retryable:
                 break
             if attempt >= retries:

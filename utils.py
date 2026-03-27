@@ -54,6 +54,25 @@ def getenv_float(key: str, default: float | None = None) -> float | None:
         return default
 
 
+def getenv_bool(key: str, default: bool | None = None) -> bool | None:
+    """
+    Safely reads a boolean env var.
+    Supported values: 1/0, true/false, yes/no, on/off.
+    """
+    val = os.getenv(key)
+    if val in (None, ""):
+        return default
+
+    normalized = str(val).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+
+    log.debug("getenv_bool: key=%r invalid value %r -> default=%r", key, val, default)
+    return default
+
+
 def with_retries(fn: Callable[[], T], *, retries: int, backoff: float) -> T:
     """
     Универсальная обёртка для повторного выполнения функции без аргументов.
