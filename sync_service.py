@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta, timezone
 # Аннотации типов
 from typing import Iterable, Optional, Dict, Any
 # Сессии ORM
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 # Часовые пояса
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -287,6 +288,20 @@ def _parse_money_ru(s: Optional[str]) -> Optional[float]:
         return None
 
 
+def _format_b24_money(value: Optional[float], *, currency: str = "RUB") -> Optional[str]:
+    """
+    Формат для UF-поля Bitrix24 типа money: "<amount>|<currency>".
+    Примеры: "0|RUB", "-2139.79|RUB".
+    """
+    if value is None:
+        return None
+
+    normalized = f"{float(value):.2f}".rstrip("0").rstrip(".")
+    if normalized in {"", "-0"}:
+        normalized = "0"
+    return f"{normalized}|{currency}"
+
+
 # ===== TZ helpers =====
 
 _TZ_OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
@@ -359,23 +374,21 @@ def _normalize_dt(s: Optional[str]) -> Optional[str]:
         from datetime import datetime as _DT
 
         tmp = raw
-        # уберём миллисекунды, если есть (наши паттерны без дробной части)
-        if "." in tmp:
-            left, right = tmp.split(".", 1)
-            if right and right[0].isdigit():
-                tmp = left
 
         # Игнорируем возможный встроенный офсет, парсить будем без него
         m = re.search(r'([+-]\d{2}:\d{2})$', tmp)
         if m:
             tmp = tmp[: -len(m.group(1))].strip()
 
+        # Уберём дробную часть секунд, но не трогаем даты формата DD.MM.YYYY.
+        tmp = re.sub(r'(\d{2}:\d{2}:\d{2})\.\d+$', r'\1', tmp)
+
         patterns = [
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
             "%Y-%m-%d",
             "%d.%m.%Y %H:%M:%S",
-            "%d.%m.%Y %H:%М",
+            "%d.%m.%Y %H:%M",
             "%d.%m.%Y",
         ]
 
@@ -487,8 +500,17 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
     logger.info("Синхронизация в Bitrix24: старт (limit=%s)", limit)
 
     with Session(engine) as session:
-        # Выбираем все записи, где synced == False
-        q = session.query(User).filter(User.synced == False)  # noqa: E712
+        # Выбираем несинхронизированные записи и обрабатываем самые свежие изменения первыми.
+        # Это важно для ручных/батчевых прогонов с limit: новые регистрации не должны застревать
+        # за старым хвостом обновлений.
+        q = (
+            session.query(User)
+            .filter(User.synced == False)  # noqa: E712
+            .order_by(
+                func.coalesce(User.update_time, User.registration_date, "").desc(),
+                User.id.desc(),
+            )
+        )
         if limit:
             q = q.limit(limit)
 
@@ -591,9 +613,7 @@ def sync_to_b24(limit: Optional[int] = None) -> int:
 
             # Баланс
             if saldo_val is not None:
-                fields[UF_B24_DEAL_SALDO] = saldo_val
-            elif saldo_raw:
-                fields[UF_B24_DEAL_SALDO] = saldo_raw
+                fields[UF_B24_DEAL_SALDO] = _format_b24_money(saldo_val)
 
             # Даты ABCP (ISO-8601 с tz)
             if reg_val:
